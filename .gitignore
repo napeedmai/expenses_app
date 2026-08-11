@@ -39,3 +39,9 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# AI tooling & personal notes (not for public repo)
+AGENTS.md
+CLAUDE.md
+.claude/
+DEPLOY_WEB_GITHUB_PAGES.md
