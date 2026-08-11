@@ -31,8 +31,8 @@
     ],
     "owner": "deepan003",
     "experiments": {
-      "_comment": "baseUrl must match the GitHub Pages sub-path, i.e. the repo name. Remove this line entirely if you deploy to a <user>.github.io repo, which is served from the root.",
-      "baseUrl": "/expense-app"
+      "_comment": "Must match the GitHub Pages sub-path exactly, i.e. the repo name (napeedmai/expenses_app). A mismatch here serves a blank page with 404s on every asset. Remove this block entirely if deploying to a <user>.github.io repo, which is served from the root.",
+      "baseUrl": "/expenses_app"
     }
   }
 }

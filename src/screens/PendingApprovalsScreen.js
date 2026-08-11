@@ -51,6 +51,7 @@ import { useSession } from '../SessionContext';
 import { useTheme } from '../ThemeContext';
 import { listPending, bulkAccept, bulkRevise, bulkReject } from '../api/client';
 import { radius, shadow, iconForType } from '../theme';
+import { showAlert } from '../utils/alert';
 
 export default function PendingApprovalsScreen({ navigation }) {
   const { session } = useSession();
@@ -131,11 +132,11 @@ export default function PendingApprovalsScreen({ navigation }) {
     if (failed.length > 0) {
       message += '\n\nNot processed:\n' + failed.map((r) => `#${r.id}: ${r.message}`).join('\n');
     }
-    Alert.alert(failed.length > 0 ? 'Done, with some issues' : 'Done', message);
+    showAlert(failed.length > 0 ? 'Done, with some issues' : 'Done', message);
   }
 
   async function handleBulkAccept() {
-    Alert.alert(
+    showAlert(
       'Accept selected?',
       `Accept ${selectedIds.length} expense${selectedIds.length === 1 ? '' : 's'}?`,
       [
@@ -150,7 +151,7 @@ export default function PendingApprovalsScreen({ navigation }) {
               exitSelectionMode();
               load();
             } catch (e) {
-              Alert.alert('Failed', e.message || 'Bulk accept failed.');
+              showAlert('Failed', e.message || 'Bulk accept failed.');
             } finally {
               setSubmitting(false);
             }
@@ -167,7 +168,7 @@ export default function PendingApprovalsScreen({ navigation }) {
 
   async function submitCommentModal() {
     if (!commentText.trim()) {
-      Alert.alert('Comment required', 'Please add a comment for the employee.');
+      showAlert('Comment required', 'Please add a comment for the employee.');
       return;
     }
     const action = commentModal;
@@ -180,7 +181,7 @@ export default function PendingApprovalsScreen({ navigation }) {
       exitSelectionMode();
       load();
     } catch (e) {
-      Alert.alert('Failed', e.message || 'Bulk action failed.');
+      showAlert('Failed', e.message || 'Bulk action failed.');
     } finally {
       setSubmitting(false);
     }

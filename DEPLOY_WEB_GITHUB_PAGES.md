@@ -18,21 +18,24 @@ Some dependencies have no real web implementation and may need
 
 ---
 
-## 1. Set the base URL to match the repo name
+Target repo: **https://github.com/napeedmai/expenses_app** (already exists,
+public, holds the source on `main`).
 
-Already added to `app.json`:
+The built site goes on a separate `gh-pages` branch so it never mixes with
+your source history.
+
+## 1. Base URL — already set
+
+`app.json` now contains:
 
 ```json
-"experiments": { "baseUrl": "/expense-app" }
+"experiments": { "baseUrl": "/expenses_app" }
 ```
 
-`baseUrl` must equal the repo name, because Pages serves project repos at
-`https://<user>.github.io/<repo>/` while Expo otherwise references assets
-from `/`. Mismatch here is the usual cause of a blank white page with 404s
-for every `.js` file in the browser console.
-
-**Exception:** if you name the repo `<your-username>.github.io`, it is served
-from the root — delete the `experiments` block entirely in that case.
+It must equal the repo name exactly, because Pages serves project repos at
+`https://napeedmai.github.io/expenses_app/` while Expo would otherwise
+reference assets from `/`. A mismatch is the usual cause of a blank white
+page with 404s on every `.js` file.
 
 ## 2. Build
 
@@ -44,55 +47,64 @@ Produces `dist/`.
 
 ## 3. Add .nojekyll  — DO NOT SKIP
 
-GitHub Pages runs Jekyll by default, and Jekyll **ignores every folder whose
-name starts with an underscore**. Expo puts all its JavaScript in `_expo/`.
-Without this file the page loads and renders nothing, with 404s on every
-bundle.
+GitHub Pages runs Jekyll, and Jekyll **ignores every folder whose name starts
+with an underscore**. Expo puts all its JavaScript in `_expo/`. Without this
+file the page loads and renders nothing, with 404s on every bundle.
 
 ```
 cd dist
 type nul > .nojekyll
 ```
 
-## 4. Push dist to a new repo
+## 4. Push dist to the gh-pages branch
 
-Create an empty repo on GitHub named `expense-app` (no README, no
-.gitignore), then from inside `dist`:
+From inside `dist` (this is a throwaway repo used only to push the build):
 
 ```
 git init
 git add -A
 git commit -m "Web build"
-git branch -M main
-git remote add origin https://github.com/<your-username>/expense-app.git
-git push -u origin main
+git branch -M gh-pages
+git remote add origin https://github.com/napeedmai/expenses_app.git
+git push --force origin gh-pages
 ```
 
-Only the built site goes in this repo, not your source. Keep it separate
-from your app source repo — `dist/` is gitignored in the project for good
-reason.
+`--force` is correct here and safe: `gh-pages` holds only generated output,
+and each deploy replaces it wholesale. It does **not** touch `main`.
+
+Note `dist/` is gitignored in the project, which is why it gets its own
+throwaway repo rather than being committed to `main`.
 
 ## 5. Enable Pages
 
 Repo → **Settings** → **Pages** → Source: **Deploy from a branch**,
-Branch: `main`, folder: `/ (root)` → Save.
+Branch: `gh-pages`, folder: `/ (root)` → Save.
 
 Live within a minute or two at:
 
 ```
-https://<your-username>.github.io/expense-app/
+https://napeedmai.github.io/expenses_app/
 ```
 
 ## 6. Redeploying after code changes
+
+From the project root:
 
 ```
 npx expo export -p web
 cd dist
 type nul > .nojekyll
+git init
 git add -A
 git commit -m "Update"
-git push
+git branch -M gh-pages
+git remote add origin https://github.com/napeedmai/expenses_app.git
+git push --force origin gh-pages
 ```
+
+`expo export` wipes `dist`, so the git setup is repeated each time. If you
+redeploy often, a GitHub Actions workflow building on push to `main` is
+worth the setup.
 
 ---
 
@@ -111,7 +123,7 @@ on prod.
 Apply it to `REPO` with the Pages origin allowed:
 
 ```
-https://<your-username>.github.io
+https://napeedmai.github.io
 ```
 
 Set `p_origins_allowed` on the ORDS modules to that origin. Check what is

@@ -14,6 +14,7 @@
 // response gave us; there's nothing left in this file that knows a
 // client secret.
 
+import { Platform } from 'react-native';
 import { API_BASE_URL } from '../config';
 
 // Small pure-JS base64 encoder — used only for the Basic Auth header when
@@ -314,11 +315,25 @@ export async function submitExpense(empId, id) {
 // expo-document-picker's result gives you.
 export async function uploadAttachment(empId, id, file) {
   const formData = new FormData();
-  formData.append('file', {
-    uri: file.uri,
-    name: file.name,
-    type: file.mimeType || 'application/octet-stream',
-  });
+
+  if (Platform.OS === 'web') {
+    // React Native's FormData accepts a plain {uri, name, type} object and
+    // resolves the file itself. The browser's FormData does NOT — it needs a
+    // real Blob/File, and silently serialises that object to the string
+    // "[object Object]" instead. The upload then "succeeds" with a useless
+    // body, which is why attaching a file did nothing on web with no error.
+    //
+    // expo-document-picker gives us the actual File on web via .file; fall
+    // back to fetching the blob: URI if a future version stops doing that.
+    const blob = file.file || (await (await fetch(file.uri)).blob());
+    formData.append('file', blob, file.name);
+  } else {
+    formData.append('file', {
+      uri: file.uri,
+      name: file.name,
+      type: file.mimeType || 'application/octet-stream',
+    });
+  }
 
   const res = await fetchWithTimeout(`${API_BASE_URL}/expenses/${id}/attachment`, {
     method: 'POST',

@@ -6,6 +6,12 @@
 // Android shows the system date dialog automatically and closes itself.
 // iOS's inline/spinner picker doesn't close itself, so we wrap it in a
 // small sheet with Cancel/Done for iOS only.
+//
+// WEB: @react-native-community/datetimepicker has no web implementation, and
+// the branches below only cover 'android' and 'ios' — so on web the field
+// rendered as tappable text that opened nothing at all. Web uses a native
+// <input type="date"> instead (react-native-web renders real DOM, so this is
+// fine), which brings the browser's own date picker with it.
 
 import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, Modal, StyleSheet, Platform } from 'react-native';
@@ -25,9 +31,48 @@ function parseMDY(str) {
   return new Date(yyyy, mm - 1, dd);
 }
 
+// <input type="date"> speaks YYYY-MM-DD only; the rest of the app and the
+// backend use MM/DD/YYYY (see 23_date_format_mmddyyyy.sql).
+function mdyToISO(str) {
+  if (!str) return '';
+  const [mm, dd, yyyy] = str.split('/');
+  if (!mm || !dd || !yyyy) return '';
+  return `${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;
+}
+
+function isoToMDY(str) {
+  if (!str) return '';
+  const [yyyy, mm, dd] = str.split('-');
+  if (!yyyy || !mm || !dd) return '';
+  return `${mm}/${dd}/${yyyy}`;
+}
+
 export default function DateField({ value, onChange, disabled, placeholder, fieldStyle }) {
   const [show, setShow] = useState(false);
   const [tempDate, setTempDate] = useState(parseMDY(value));
+
+  if (Platform.OS === 'web') {
+    return (
+      <View style={fieldStyle}>
+        <input
+          type="date"
+          value={mdyToISO(value)}
+          disabled={disabled}
+          onChange={(e) => onChange(isoToMDY(e.target.value))}
+          style={{
+            border: 'none',
+            outline: 'none',
+            background: 'transparent',
+            font: 'inherit',
+            fontSize: 15,
+            color: value ? '#000' : '#999',
+            width: '100%',
+            padding: 0,
+          }}
+        />
+      </View>
+    );
+  }
 
   function open() {
     setTempDate(parseMDY(value));

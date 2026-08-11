@@ -12,16 +12,17 @@
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
-  View,
+  ActivityIndicator,
+  Alert,
+  Image,
+  Modal,
+  Platform,
+  ScrollView,
+  StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  StyleSheet,
-  ScrollView,
-  ActivityIndicator,
-  Alert,
-  Modal,
-  Image,
+  View,
 } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 // Using the /legacy import on purpose — SDK 54 replaced downloadAsync with
@@ -36,6 +37,7 @@ import DateField from '../components/DateField';
 import { EXPENSE_TYPES } from '../constants/expenseTypes';
 import { radius, shadow, fileBadgeForName, stageLabel } from '../theme';
 import { Ionicons } from '@expo/vector-icons';
+import { showAlert } from '../utils/alert';
 import {
   getExpense,
   createDraft,
@@ -216,18 +218,18 @@ export default function AddEditExpenseScreen({ route, navigation }) {
 
   async function handleSaveDraft() {
     if (!fromDate || !toDate || !amount) {
-      Alert.alert('Missing fields', 'From Date, To Date, and Amount are required.');
+      showAlert('Missing fields', 'From Date, To Date, and Amount are required.');
       return;
     }
     setSaving(true);
     setError(null);
     try {
       await ensureDraftSaved();
-      Alert.alert('Saved', 'Draft saved successfully.');
+      showAlert('Saved', 'Draft saved successfully.');
     } catch (e) {
       const message = e.message || 'Failed to save.';
       setError(message);
-      Alert.alert('Save failed', message);
+      showAlert('Save failed', message);
     } finally {
       setSaving(false);
     }
@@ -238,7 +240,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
     // attaching a file — simpler and more predictable than auto-saving
     // behind the scenes.
     if (!expenseId) {
-      Alert.alert('Save first', 'Save this as a draft before attaching a file.');
+      showAlert('Save first', 'Save this as a draft before attaching a file.');
       return;
     }
 
@@ -252,7 +254,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
     } catch (e) {
       const message = e.message || 'Failed to open the file/photo picker.';
       setError(message);
-      Alert.alert('Could not open picker', message);
+      showAlert('Could not open picker', message);
       return;
     }
     if (result.canceled) return;
@@ -261,14 +263,14 @@ export default function AddEditExpenseScreen({ route, navigation }) {
 
     const ext = (file.name || '').split('.').pop().toLowerCase();
     if (!ALLOWED_ATTACHMENT_EXTENSIONS.includes(ext)) {
-      Alert.alert(
+      showAlert(
         'File type not allowed',
         `Allowed file types: ${ALLOWED_ATTACHMENT_EXTENSIONS.join(', ').toUpperCase()}.`
       );
       return;
     }
     if (typeof file.size === 'number' && file.size > MAX_ATTACHMENT_BYTES) {
-      Alert.alert(
+      showAlert(
         'File too large',
         `Maximum file size is 1 MB. This file is ${(file.size / (1024 * 1024)).toFixed(2)} MB — please choose a smaller file.`
       );
@@ -280,20 +282,20 @@ export default function AddEditExpenseScreen({ route, navigation }) {
     try {
       await uploadAttachment(empId, expenseId, file);
       setAttachmentInfo({ name: file.name, alreadyUploaded: true });
-      Alert.alert('Uploaded', 'Attachment uploaded successfully.');
+      showAlert('Uploaded', 'Attachment uploaded successfully.');
     } catch (e) {
       // The backend returns a clear message for disallowed file types too
       // (pdf, jpg, jpeg, png, xlsx, xls, csv, rar only).
       const message = e.message || 'Failed to upload attachment.';
       setError(message);
-      Alert.alert('Upload failed', message);
+      showAlert('Upload failed', message);
     } finally {
       setSaving(false);
     }
   }
 
   function handleDelete() {
-    Alert.alert(
+    showAlert(
       'Delete expense',
       'Are you sure you want to delete this draft? This cannot be undone.',
       [
@@ -310,7 +312,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
             } catch (e) {
               const message = e.message || 'Failed to delete.';
               setError(message);
-              Alert.alert('Delete failed', message);
+              showAlert('Delete failed', message);
               setSaving(false);
             }
           },
@@ -328,6 +330,24 @@ export default function AddEditExpenseScreen({ route, navigation }) {
     setError(null);
     try {
       const headers = await getAttachmentDownloadHeaders(empId);
+
+      // Web has no filesystem to download into (FileSystem.cacheDirectory is
+      // null and downloadAsync is unimplemented), and no OS share sheet.
+      // Fetch the bytes, wrap them in an object URL, and either show the
+      // image inline or hand the file to the browser in a new tab.
+      if (Platform.OS === 'web') {
+        const res = await fetch(getAttachmentUrl(expenseId), { headers });
+        if (!res.ok) throw new Error('Failed to download attachment.');
+        const blob = await res.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        if ((blob.type || '').startsWith('image/')) {
+          setPreviewImageUri(objectUrl);
+        } else {
+          window.open(objectUrl, '_blank');
+        }
+        return;
+      }
+
       const safeName = (attachmentInfo && attachmentInfo.name) || `attachment-${expenseId}`;
       const localUri = FileSystem.cacheDirectory + safeName;
 
@@ -347,12 +367,12 @@ export default function AddEditExpenseScreen({ route, navigation }) {
       if (canShare) {
         await Sharing.shareAsync(result.uri, { mimeType: contentType || undefined });
       } else {
-        Alert.alert('Preview not available', 'This device has no way to open this file type.');
+        showAlert('Preview not available', 'This device has no way to open this file type.');
       }
     } catch (e) {
       const message = e.message || 'Failed to preview attachment.';
       setError(message);
-      Alert.alert('Preview failed', message);
+      showAlert('Preview failed', message);
     } finally {
       setPreviewing(false);
     }
@@ -361,7 +381,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
   async function handleSubmit() {
     const missingField = findMissingRequiredField();
     if (missingField) {
-      Alert.alert('Missing fields', `${missingField} is required. Every field except Bill Date must be filled in before you can submit.`);
+      showAlert('Missing fields', `${missingField} is required. Every field except Bill Date must be filled in before you can submit.`);
       return;
     }
     setSaving(true);
@@ -375,14 +395,14 @@ export default function AddEditExpenseScreen({ route, navigation }) {
       // it was the following updateExpense-on-retry that failed instead).
       const message = e.message || 'Failed to save this expense.';
       setError(message);
-      Alert.alert('Save failed', message);
+      showAlert('Save failed', message);
       setSaving(false);
       return;
     }
 
     try {
       await submitExpense(empId, idToSubmit);
-      Alert.alert('Submitted', 'Expense submitted for approval.', [
+      showAlert('Submitted', 'Expense submitted for approval.', [
         { text: 'OK', onPress: () => navigation.goBack() },
       ]);
     } catch (e) {
@@ -392,7 +412,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
       // second, duplicate draft.
       const message = e.message || 'Failed to submit.';
       setError(message);
-      Alert.alert(
+      showAlert(
         'Saved as draft, but not submitted',
         `Your details were saved, but submitting for approval failed: ${message}\n\nTap Submit Claim again to retry — you won't create a duplicate.`
       );

@@ -18,6 +18,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSession } from '../SessionContext';
 import { useTheme } from '../ThemeContext';
 import { radius, shadow } from '../theme';
+import { showAlert } from '../utils/alert';
 
 export default function SettingsScreen() {
   const { session, logout } = useSession();
@@ -45,7 +46,7 @@ export default function SettingsScreen() {
   }
 
   function handleLogout() {
-    Alert.alert('Log out?', 'You can log back in with your email and password any time.', [
+    showAlert('Log out?', 'You can log back in with your email and password any time.', [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Log out', style: 'destructive', onPress: logout },
     ]);

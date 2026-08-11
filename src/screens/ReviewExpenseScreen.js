@@ -12,16 +12,17 @@
 
 import React, { useState, useMemo } from 'react';
 import {
-  View,
+  ActivityIndicator,
+  Alert,
+  Image,
+  Modal,
+  Platform,
+  ScrollView,
+  StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  StyleSheet,
-  ScrollView,
-  ActivityIndicator,
-  Alert,
-  Modal,
-  Image,
+  View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -36,6 +37,7 @@ import {
   getAttachmentDownloadHeaders,
 } from '../api/client';
 import { radius, shadow, fileBadgeForName, stageLabelShort } from '../theme';
+import { showAlert } from '../utils/alert';
 
 export default function ReviewExpenseScreen({ route, navigation }) {
   const { session } = useSession();
@@ -51,7 +53,7 @@ export default function ReviewExpenseScreen({ route, navigation }) {
 
   async function handleAction(action) {
     if ((action === 'revise' || action === 'reject') && !comment.trim()) {
-      Alert.alert('Comment required', `Please add a comment explaining why you're choosing to ${action} this.`);
+      showAlert('Comment required', `Please add a comment explaining why you're choosing to ${action} this.`);
       return;
     }
     setSubmitting(action);
@@ -59,7 +61,7 @@ export default function ReviewExpenseScreen({ route, navigation }) {
     try {
       const fn = action === 'accept' ? acceptExpense : action === 'revise' ? reviseExpense : rejectExpense;
       await fn(empId, expense.id, comment.trim() || null);
-      Alert.alert('Done', `Expense ${action === 'accept' ? 'accepted' : action + 'd'}.`, [
+      showAlert('Done', `Expense ${action === 'accept' ? 'accepted' : action + 'd'}.`, [
         { text: 'OK', onPress: () => navigation.goBack() },
       ]);
     } catch (e) {
@@ -76,6 +78,22 @@ export default function ReviewExpenseScreen({ route, navigation }) {
     setError(null);
     try {
       const headers = await getAttachmentDownloadHeaders(empId);
+
+      // See AddEditExpenseScreen: no filesystem or share sheet on web, so
+      // fetch the bytes and use an object URL instead.
+      if (Platform.OS === 'web') {
+        const res = await fetch(getAttachmentUrl(expense.id), { headers });
+        if (!res.ok) throw new Error('Failed to download attachment.');
+        const blob = await res.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        if ((blob.type || '').startsWith('image/')) {
+          setPreviewImageUri(objectUrl);
+        } else {
+          window.open(objectUrl, '_blank');
+        }
+        return;
+      }
+
       const localUri = FileSystem.cacheDirectory + expense.attachment_filename;
       const result = await FileSystem.downloadAsync(getAttachmentUrl(expense.id), localUri, { headers });
       if (result.status !== 200) throw new Error('Failed to download attachment.');
@@ -89,7 +107,7 @@ export default function ReviewExpenseScreen({ route, navigation }) {
       if (canShare) {
         await Sharing.shareAsync(result.uri, { mimeType: contentType || undefined });
       } else {
-        Alert.alert('Preview not available', 'This device has no way to open this file type.');
+        showAlert('Preview not available', 'This device has no way to open this file type.');
       }
     } catch (e) {
       setError(e.message || 'Failed to preview attachment.');
