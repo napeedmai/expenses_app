@@ -228,6 +228,41 @@ export async function login(username, password) {
   return handle(res, /* p_skipAuthFailureHook */ true);
 }
 
+// ---- Currency ----
+//
+// Expenses are entered in whatever currency the receipt is in and converted
+// to USD for reporting. The rate is chosen by the month the expense PERIOD
+// starts in (from_date), not the bill date — a May bill for April travel
+// uses April's rate. See 45_currency_conversion.sql.
+//
+// The conversion shown here and the conversion stored on save both come from
+// the same server-side get_exchange_rate() function, so the preview can
+// never disagree with what actually gets saved.
+
+export async function listCurrencies(empId) {
+  const res = await fetchWithTimeout(`${API_BASE_URL}/expenses/currencies`, {
+    headers: await authHeaders(empId),
+  });
+  return handle(res);
+}
+
+// on_date should be the expense's from_date in MM/DD/YYYY. Passing amount is
+// optional — when given, the response includes amount_usd so the screen
+// doesn't have to do the multiplication itself and risk drifting from the
+// server's rounding.
+export async function getExchangeRate(empId, currency, onDate, amount) {
+  const params = new URLSearchParams({ currency });
+  if (onDate) params.append('on_date', onDate);
+  if (amount !== undefined && amount !== null && amount !== '') {
+    params.append('amount', String(amount));
+  }
+
+  const res = await fetchWithTimeout(`${API_BASE_URL}/expenses/exchange-rate?${params.toString()}`, {
+    headers: await authHeaders(empId),
+  });
+  return handle(res);
+}
+
 // ---- Employee-facing endpoints (Phase 2A) ----
 
 // Checks that an EMPID actually exists in EMPLOYEEDETAILS, and returns their

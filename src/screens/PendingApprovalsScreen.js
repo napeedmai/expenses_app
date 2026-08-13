@@ -207,7 +207,11 @@ export default function PendingApprovalsScreen({ navigation }) {
         <View style={{ flex: 1 }}>
           <Text style={styles.rowTitle}>{item.emp_name || `Employee #${item.emp_id}`}</Text>
           <Text style={styles.rowSubtitle}>
-            {item.type || 'Expense'} · ₹{item.amount} · {item.from_date} to {item.to_date}
+            {item.type || 'Expense'} ·{' '}
+            {item.currency ? `${item.amount} ${item.currency}` : `₹${item.amount}`}
+            {item.amount_usd != null && item.currency !== 'USD' ? ` ($${item.amount_usd})` : ''}
+            {' · '}
+            {item.from_date} to {item.to_date}
           </Text>
         </View>
         {!selectionMode ? <Ionicons name="chevron-forward" size={16} color={colors.textFaint} /> : null}

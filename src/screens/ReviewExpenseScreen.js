@@ -145,7 +145,29 @@ export default function ReviewExpenseScreen({ route, navigation }) {
 
       <View style={styles.card}>
         <Row styles={styles} label="Type" value={expense.type || '—'} />
-        <Row styles={styles} label="Amount" value={`₹${expense.amount}`} />
+        {/* Show the amount as submitted, in its own currency, with the USD
+            equivalent beneath. A reviewer needs the original to match the
+            receipt in front of them, and the USD figure to compare against
+            other claims. Hardcoding ₹ here would have labelled a dollar or
+            euro expense as rupees. */}
+        <Row
+          styles={styles}
+          label="Amount"
+          value={
+            expense.currency
+              ? `${expense.amount} ${expense.currency}`
+              : `₹${expense.amount}`
+          }
+        />
+        {expense.amount_usd != null && expense.currency !== 'USD' ? (
+          <Row
+            styles={styles}
+            label="Amount (USD)"
+            value={`$${expense.amount_usd}${
+              expense.exchange_rate ? `  ·  1 ${expense.currency} = $${expense.exchange_rate}` : ''
+            }`}
+          />
+        ) : null}
         <Row styles={styles} label="Period" value={`${expense.from_date} to ${expense.to_date}`} />
         {expense.bill_no ? <Row styles={styles} label="Bill No." value={expense.bill_no} /> : null}
         {expense.bill_date ? <Row styles={styles} label="Bill Date" value={expense.bill_date} /> : null}

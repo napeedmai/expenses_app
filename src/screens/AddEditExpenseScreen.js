@@ -48,6 +48,8 @@ import {
   listMyProjects,
   getAttachmentUrl,
   getAttachmentDownloadHeaders,
+  listCurrencies,
+  getExchangeRate,
 } from '../api/client';
 
 const EDITABLE_STATUSES = ['DRAFT', 'REVISION_REQUESTED'];
@@ -59,6 +61,10 @@ const EDITABLE_STATUSES = ['DRAFT', 'REVISION_REQUESTED'];
 // without those three), not a UX choice, so it stays as-is.
 const ALLOWED_ATTACHMENT_EXTENSIONS = ['pdf', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'csv', 'rar'];
 const MAX_ATTACHMENT_BYTES = 1 * 1024 * 1024; // 1 MB
+
+// Must match the backend default in 46_currency_endpoints.sql and the
+// backfill value in 45_currency_conversion.sql.
+const DEFAULT_CURRENCY = 'INR';
 
 // A random id generated once per "new expense" attempt (see the
 // clientRequestId state below) and sent with every draft-creation request
@@ -111,6 +117,14 @@ export default function AddEditExpenseScreen({ route, navigation }) {
   const [myProjects, setMyProjects] = useState(null); // null = still loading, [] = loaded but empty
   const [projectsError, setProjectsError] = useState(false);
 
+  // Currency + live USD conversion. DEFAULT_CURRENCY matches the backend's
+  // fallback for requests that omit it (46_currency_endpoints.sql) and the
+  // value existing rows were backfilled with — keep all three in step.
+  const [currency, setCurrency] = useState(DEFAULT_CURRENCY);
+  const [currencies, setCurrencies] = useState([]);
+  const [conversion, setConversion] = useState(null); // { exchange_rate, amount_usd, rate_month }
+  const [conversionError, setConversionError] = useState(null);
+
   const isLocked = !!expenseId && !EDITABLE_STATUSES.includes(status);
 
   useEffect(() => {
@@ -123,6 +137,51 @@ export default function AddEditExpenseScreen({ route, navigation }) {
         setMyProjects([]);
       });
   }, [empId]);
+
+  // The dropdown only ever offers currencies the server can actually price,
+  // so a user can't pick one that fails on save. If the lookup fails we fall
+  // back to the default alone rather than leaving an empty picker.
+  useEffect(() => {
+    listCurrencies(empId)
+      .then((data) => {
+        const items = Array.isArray(data.items) ? data.items : [];
+        setCurrencies(items.length ? items : [{ currency: DEFAULT_CURRENCY }]);
+      })
+      .catch(() => setCurrencies([{ currency: DEFAULT_CURRENCY }]));
+  }, [empId]);
+
+  // Recalculate whenever the amount, currency or period start changes.
+  // from_date drives which month's rate applies, so editing it can change
+  // the converted figure even when the amount hasn't moved.
+  //
+  // Debounced because this fires on every keystroke in the amount field.
+  useEffect(() => {
+    if (!amount || !currency) {
+      setConversion(null);
+      setConversionError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      getExchangeRate(empId, currency, fromDate || undefined, amount)
+        .then((data) => {
+          if (cancelled) return;
+          setConversion(data);
+          setConversionError(null);
+        })
+        .catch((e) => {
+          if (cancelled) return;
+          setConversion(null);
+          setConversionError(e.message || 'Could not fetch the exchange rate.');
+        });
+    }, 400);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [empId, amount, currency, fromDate]);
 
   const loadExisting = useCallback(async () => {
     if (!initialExpenseId) return;
@@ -140,6 +199,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
       setProjectId(data.project_id != null ? String(data.project_id) : '');
       setType(data.type || '');
       setAmount(data.amount != null ? String(data.amount) : '');
+      setCurrency(data.currency || DEFAULT_CURRENCY);
       setDescription(data.description || '');
       setAttachmentInfo(
         data.attachment_filename ? { name: data.attachment_filename, alreadyUploaded: true } : null
@@ -164,6 +224,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
       project_id: projectId ? Number(projectId) : null,
       type: type || null,
       amount: amount ? Number(amount) : null,
+      currency: currency || DEFAULT_CURRENCY,
       description: description || null,
       // Only relevant to createDraft (expenseId is still null at that
       // point) — updateExpense doesn't need it, and the backend ignores it
@@ -545,13 +606,55 @@ export default function AddEditExpenseScreen({ route, navigation }) {
       </Field>
 
       <Field label="Amount *" styles={styles}>
-        <TextInput
-          style={fieldStyle(isLocked)}
-          value={amount}
-          onChangeText={setAmount}
-          editable={!isLocked}
-          keyboardType="decimal-pad"
-        />
+        <View style={styles.amountRow}>
+          <TextInput
+            style={[fieldStyle(isLocked), { flex: 1 }]}
+            value={amount}
+            onChangeText={setAmount}
+            editable={!isLocked}
+            keyboardType="decimal-pad"
+          />
+          <View style={{ width: 108 }}>
+            <PickerField
+              options={currencies}
+              valueKey="currency"
+              labelKey="currency"
+              value={currency}
+              onSelect={setCurrency}
+              disabled={isLocked}
+              placeholder="CUR"
+              fieldStyle={fieldStyle(isLocked)}
+            />
+          </View>
+        </View>
+
+        {/* Converted amount. Shown for every currency including USD — a
+            silent 1:1 line is clearer than the figure disappearing and
+            leaving the user unsure whether conversion happened.
+
+            rate_month is the month the rate ACTUALLY came from, which is not
+            always the month of the expense: if no rate has been loaded for
+            that month, the server falls back to the current open rate and
+            sets is_fallback. Saying "JUN-2026 rate" when the number came
+            from October would be a lie an approver might act on, so the
+            fallback is called out explicitly. */}
+        {conversionError ? (
+          <Text style={styles.conversionError}>{conversionError}</Text>
+        ) : conversion ? (
+          <>
+            <Text style={styles.conversionNote}>
+              ≈ <Text style={styles.conversionUsd}>${conversion.amount_usd}</Text> USD
+              {'  ·  '}1 {conversion.currency} = ${conversion.exchange_rate}
+              {conversion.rate_month ? `  ·  ${conversion.rate_month} rate` : ''}
+            </Text>
+            {conversion.is_fallback === 'Y' ? (
+              <Text style={styles.conversionWarn}>
+                No rate loaded for {conversion.requested_month} — using the current{' '}
+                {conversion.rate_month} rate.
+              </Text>
+            ) : null}
+          </>
+        ) : null}
       </Field>
 
       <Field label="Description *" styles={styles}>
@@ -671,6 +774,11 @@ function createStyles(colors) {
   row2: { flexDirection: 'row', gap: 12 },
   halfField: { flex: 1 },
   field: { marginBottom: 14 },
+  amountRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-start' },
+  conversionNote: { marginTop: 6, fontSize: 12, color: colors.textMuted },
+  conversionUsd: { fontWeight: '800', color: colors.text },
+  conversionError: { marginTop: 6, fontSize: 12, color: '#c0392b' },
+  conversionWarn: { marginTop: 3, fontSize: 11, color: '#b26a00' },
   label: { fontSize: 11, color: colors.textMuted, marginBottom: 6, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.3 },
   input: {
     borderWidth: 1,

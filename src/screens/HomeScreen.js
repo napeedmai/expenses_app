@@ -76,11 +76,27 @@ function expenseMonthKey(e) {
   return parseMDY(e.bill_date) || parseMDY(e.from_date);
 }
 
+// Every total on this screen is in USD, via amount_usd.
+//
+// Summing the raw `amount` column would be meaningless once expenses exist
+// in more than one currency — it would add ₹1000 to $50 to €200 and report
+// 1250, a number in no currency at all. amount_usd is stamped at save time
+// from the rate for the expense's own period month, so these totals stay
+// stable even if a rate row is corrected later.
+//
+// Falls back to `amount` only for rows predating the currency columns, which
+// the backfill in 45_currency_conversion.sql should have already handled.
+function usdAmount(e) {
+  const usd = Number(e.amount_usd);
+  if (Number.isFinite(usd)) return usd;
+  return Number(e.amount) || 0;
+}
+
 function categoryBreakdown(expenses) {
   const sums = {};
   expenses.forEach((e) => {
     const key = e.type || 'Other';
-    sums[key] = (sums[key] || 0) + (Number(e.amount) || 0);
+    sums[key] = (sums[key] || 0) + usdAmount(e);
   });
   const entries = Object.entries(sums).sort((a, b) => b[1] - a[1]).slice(0, 3);
   const max = entries.length ? entries[0][1] : 1;
@@ -164,7 +180,7 @@ export default function HomeScreen({ navigation }) {
     ...m,
     total: expenses
       .filter((e) => e.status === 'APPROVED' && expenseMonthKey(e) === m.key)
-      .reduce((sum, e) => sum + (Number(e.amount) || 0), 0),
+      .reduce((sum, e) => sum + usdAmount(e), 0),
   }));
   const barsMax = Math.max(1, ...monthsWithTotals.map((m) => m.total));
   const selectedMonth = monthsWithTotals.find((m) => m.key === selectedMonthKey) || monthsWithTotals[monthsWithTotals.length - 1];
@@ -222,7 +238,10 @@ export default function HomeScreen({ navigation }) {
             <Text style={styles.heroLabel}>
               Approved {isCurrentMonth ? 'this month' : `in ${selectedMonth.label} ${selectedMonth.year}`}
             </Text>
-            <Text style={styles.heroAmount}>&#8377;{selectedMonth.total.toLocaleString('en-IN')}</Text>
+            {/* Totals are USD — they sum amount_usd across expenses that may
+                be in different currencies, so a rupee symbol here would be
+                wrong for any non-INR claim. */}
+            <Text style={styles.heroAmount}>${selectedMonth.total.toLocaleString('en-US', { maximumFractionDigits: 2 })}</Text>
           </View>
         </View>
         <View style={styles.barsRow}>
@@ -251,7 +270,7 @@ export default function HomeScreen({ navigation }) {
             <View style={{ flex: 1 }}>
               <View style={styles.catTopLine}>
                 <Text style={styles.catLabel}>{c.type}</Text>
-                <Text style={styles.catAmount}>&#8377;{c.total.toLocaleString('en-IN')}</Text>
+                <Text style={styles.catAmount}>${c.total.toLocaleString('en-US', { maximumFractionDigits: 2 })}</Text>
               </View>
               <View style={styles.catTrack}>
                 <View style={[styles.catFill, { width: `${Math.round(c.pct * 100)}%` }]} />
@@ -310,7 +329,8 @@ export default function HomeScreen({ navigation }) {
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.activityTitle}>
-                  {item.type || 'Expense'} &mdash; &#8377;{item.amount}
+                  {item.type || 'Expense'} &mdash;{' '}
+                  {item.currency ? `${item.amount} ${item.currency}` : `₹${item.amount}`}
                 </Text>
                 <Text style={styles.activitySubtitle}>
                   {item.from_date} to {item.to_date}

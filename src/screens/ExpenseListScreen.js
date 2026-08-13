@@ -104,7 +104,9 @@ export default function ExpenseListScreen({ navigation }) {
         </View>
         <View style={{ flex: 1 }}>
           <Text style={styles.rowTitle}>
-            {item.type || 'Expense'} &mdash; &#8377;{item.amount}
+            {item.type || 'Expense'} &mdash;{' '}
+            {item.currency ? `${item.amount} ${item.currency}` : `₹${item.amount}`}
+            {item.amount_usd != null && item.currency !== 'USD' ? ` ($${item.amount_usd})` : ''}
           </Text>
           <Text style={styles.rowSubtitle}>
             {item.from_date} to {item.to_date}
