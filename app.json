@@ -1,19 +1,24 @@
 {
   "expo": {
-    "name": "expense-app",
+    "name": "Expenses",
     "slug": "expense-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+    "primaryColor": "#ffffff",
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.trinamix.expenseapp",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -21,18 +26,28 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "package": "com.napeedmai.expenseapp"
+      "package": "com.trinamix.expenseapp",
+      "permissions": [
+        "android.permission.INTERNET",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      "expo-notifications"
     ],
-    "owner": "deepan003",
+    "owner": "trinamix",
     "experiments": {
-      "_comment": "Must match the GitHub Pages sub-path exactly, i.e. the repo name (napeedmai/expenses_app). A mismatch here serves a blank page with 404s on every asset. Remove this block entirely if deploying to a <user>.github.io repo, which is served from the root.",
+      "_comment": "baseUrl must match the GitHub Pages sub-path exactly, i.e. the repo name (napeedmai/expenses_app). A mismatch serves a blank page with 404s on every asset. Remove this block entirely if deploying to a <user>.github.io repo, which is served from the root. It affects the WEB build only -- native store builds ignore it.",
       "baseUrl": "/expenses_app"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "36ae7474-b32f-421f-bf60-d98fd73d07b5"
+      }
     }
   }
 }
