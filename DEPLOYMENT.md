@@ -5,7 +5,7 @@ how to deploy it somewhere new, and what to check before trusting it.
 
 Two files are the deliverable. This one, and `db/MASTER_DEPLOY.sql`, which
 is the entire backend in one runnable script.
-
+ 
 **Read [§12 Fault dictionary](#12-fault-dictionary) before debugging
 anything.** Almost every failure in this stack reports a cause that is not
 the real one — a missing PL/SQL object arrives as an HTTP 403, a wrong APEX
