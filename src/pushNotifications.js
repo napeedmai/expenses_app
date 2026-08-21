@@ -39,14 +39,56 @@ const IS_EXPO_GO =
 // is open in the foreground — without this, foreground pushes arrive
 // silently with no visible banner. Skipped in Expo Go since it can't
 // receive remote pushes there anyway.
+//
+// shouldShowBanner / shouldShowList, NOT shouldShowAlert. The single
+// shouldShowAlert key was split into these two in expo-notifications for
+// SDK 53+, and the old key is now ignored — so a handler still using it
+// returns "show nothing", and a notification arriving while the app is
+// open produces no banner at all while still being delivered. That is a
+// silent presentation failure, not a delivery failure: the push arrives
+// fine, the OS just never draws it.
+//   shouldShowBanner -> the heads-up banner that slides down
+//   shouldShowList   -> the entry in the notification drawer/centre
 if (!IS_EXPO_GO) {
   Notifications.setNotificationHandler({
     handleNotification: async () => ({
-      shouldShowAlert: true,
+      shouldShowBanner: true,
+      shouldShowList: true,
       shouldPlaySound: true,
       shouldSetBadge: false,
     }),
   });
+}
+
+// Why registration last succeeded or failed, so a human can find out.
+//
+// Registration is deliberately non-fatal — the app is fully usable without
+// push — but "non-fatal" had been implemented as an empty catch block, which
+// made a failure completely undiagnosable: the phone simply never appeared in
+// EMP_PUSH_TOKENS and nothing anywhere said why. Every step below records its
+// outcome here, and Settings displays it.
+let lastPushStatus = { state: 'idle', detail: 'Not attempted yet.' };
+const statusListeners = new Set();
+
+function setPushStatus(state, detail) {
+  lastPushStatus = { state, detail, at: new Date().toISOString() };
+  statusListeners.forEach((fn) => {
+    try {
+      fn(lastPushStatus);
+    } catch (e) {
+      /* a broken listener must not break registration */
+    }
+  });
+}
+
+export function getPushStatus() {
+  return lastPushStatus;
+}
+
+export function subscribeToPushStatus(fn) {
+  statusListeners.add(fn);
+  fn(lastPushStatus);
+  return () => statusListeners.delete(fn);
 }
 
 // Call once near the root of the app (see App.js) whenever a session
@@ -60,16 +102,37 @@ export function usePushNotifications(empId) {
   useEffect(() => {
     if (!empId) return;
     if (registeredFor.current === empId) return;
-    if (IS_EXPO_GO) return; // see note above — Expo Go can't do this at all
+    if (IS_EXPO_GO) {
+      setPushStatus(
+        'unsupported',
+        'Running in Expo Go, which cannot receive push notifications since SDK 53. Install an EAS build instead.'
+      );
+      return;
+    }
 
     let cancelled = false;
 
     async function register() {
       try {
+        // Android 8+ decides how intrusive a notification is from its
+        // CHANNEL, not from the message. AndroidImportance.DEFAULT puts the
+        // notification in the drawer silently — no heads-up banner, no
+        // sound — which looks exactly like push being broken even though
+        // delivery worked. MAX is what produces the banner that slides
+        // down over whatever the person is doing.
+        //
+        // Importance is fixed when the channel is FIRST created. Raising it
+        // here does nothing on a phone that already has the old channel;
+        // the app must be reinstalled, or the channel renamed. Hence
+        // 'expense-updates' rather than reusing 'default'.
         if (Platform.OS === 'android') {
-          await Notifications.setNotificationChannelAsync('default', {
-            name: 'default',
-            importance: Notifications.AndroidImportance.DEFAULT,
+          await Notifications.setNotificationChannelAsync('expense-updates', {
+            name: 'Expense updates',
+            description: 'Approvals, revisions and rejections on your expenses.',
+            importance: Notifications.AndroidImportance.MAX,
+            vibrationPattern: [0, 250, 250, 250],
+            lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+            sound: 'default',
           });
         }
 
@@ -79,28 +142,55 @@ export function usePushNotifications(empId) {
           const { status } = await Notifications.requestPermissionsAsync();
           finalStatus = status;
         }
-        if (finalStatus !== 'granted' || cancelled) {
-          return; // user declined, or this screen unmounted mid-request
+        if (cancelled) return;
+        if (finalStatus !== 'granted') {
+          setPushStatus(
+            'denied',
+            `Notification permission is "${finalStatus}". Enable notifications for this app in the phone's settings, then log out and back in.`
+          );
+          return;
         }
 
         const projectId =
           Constants?.expoConfig?.extra?.eas?.projectId || Constants?.easConfig?.projectId;
 
-        const tokenResponse = await Notifications.getExpoPushTokenAsync(
-          projectId ? { projectId } : undefined
-        );
-        const token = tokenResponse && tokenResponse.data;
-        if (!token || cancelled) return;
+        if (!projectId) {
+          setPushStatus(
+            'no-project-id',
+            'No EAS projectId in the build. Run "eas init", commit app.json, and rebuild the app.'
+          );
+          return;
+        }
 
-        await registerPushToken(empId, token);
+        const tokenResponse = await Notifications.getExpoPushTokenAsync({ projectId });
+        const token = tokenResponse && tokenResponse.data;
+        if (cancelled) return;
+        if (!token) {
+          setPushStatus('no-token', 'Expo returned no push token for this device.');
+          return;
+        }
+
+        // Reaching the server is a separate failure from getting a token, and
+        // they need different fixes -- so they are reported separately.
+        try {
+          await registerPushToken(empId, token);
+        } catch (e) {
+          setPushStatus(
+            'server-rejected',
+            `Got a token but the server would not store it: ${e.message || e}`
+          );
+          return;
+        }
+
         registeredFor.current = empId;
+        setPushStatus('registered', `Registered as ${token.slice(0, 28)}...`);
       } catch (e) {
-        // Non-fatal by design — the app works fully without push
-        // notifications, this just means this particular device won't
-        // receive them. The most common cause during development is
-        // running in Expo Go rather than a development build (see the
-        // note at the top of this file), which isn't something to alert
-        // the user about every time the app opens.
+        // Still non-fatal — the app works fully without push, and nobody
+        // wants an error dialog on every launch because notifications are
+        // unavailable. But the reason is now recorded rather than discarded:
+        // Settings shows it, which is the difference between "push doesn't
+        // work" and knowing which of the six steps above failed.
+        setPushStatus('error', String((e && e.message) || e));
       }
     }
 

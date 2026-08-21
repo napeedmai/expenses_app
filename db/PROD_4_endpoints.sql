@@ -711,35 +711,19 @@ BEGIN
 
         IF l_status = 'DRAFT' THEN
           l_manager_id := get_project_manager_empid(l_project_id);
+          l_finance_id := get_finance_manager_empid();
 
           UPDATE expenses
           SET status = 'SUBMITTED',
               current_stage = 'MANAGER',
               manager_empid = l_manager_id,
-              finance_manager_empid = 3680,
+              finance_manager_empid = l_finance_id,
               submitted_by = l_emp_id,
               submitted_at = SYSTIMESTAMP
           WHERE id = :id;
 
-          BEGIN
-            SELECT company_email INTO l_emp_email FROM employeedetails WHERE empid = l_emp_id;
-            IF l_manager_id IS NOT NULL THEN
-              SELECT company_email INTO l_mgr_email FROM employeedetails WHERE empid = l_manager_id;
-            END IF;
-
-            IF l_emp_email IS NOT NULL THEN
-              APEX_MAIL.SEND(p_to => l_emp_email, p_from => l_emp_email,
-                p_subj => 'Expense #' || :id || ' submitted',
-                p_body => 'Your expense has been submitted for approval.');
-            END IF;
-            IF l_mgr_email IS NOT NULL THEN
-              APEX_MAIL.SEND(p_to => l_mgr_email, p_from => l_emp_email,
-                p_subj => 'Expense #' || :id || ' awaiting your approval',
-                p_body => 'An expense has been submitted and needs your review.');
-            END IF;
-          EXCEPTION
-            WHEN OTHERS THEN NULL;
-          END;
+          -- TO the project manager, CC the employee. See send_expense_mail.
+          send_expense_mail(:id, 'SUBMITTED', l_emp_id);
 
           send_push_notification(l_emp_id, 'Expense Submitted',
             'Your expense #' || :id || ' was submitted for approval.', :id);

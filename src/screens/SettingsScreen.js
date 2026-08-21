@@ -9,7 +9,7 @@
 // padding clears the floating capsule tab bar (this is a tab landing
 // screen, so the tab bar stays visible here).
 
-import React, { useState, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Alert, ScrollView, Switch } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
@@ -19,6 +19,21 @@ import { useSession } from '../SessionContext';
 import { useTheme } from '../ThemeContext';
 import { radius, shadow } from '../theme';
 import { showAlert } from '../utils/alert';
+import { subscribeToPushStatus } from '../pushNotifications';
+
+// Plain-language explanation per registration state. The point is that
+// someone holding the phone can tell you WHY push isn't working, instead of
+// the failure being invisible and having to be guessed at from the server.
+const PUSH_STATE_LABEL = {
+  registered: { text: 'This device will receive notifications', icon: 'checkmark-circle', tone: 'ok' },
+  idle: { text: 'Not registered yet — reopen the app after logging in', icon: 'ellipse-outline', tone: 'muted' },
+  denied: { text: 'Notifications are blocked in your phone settings', icon: 'close-circle', tone: 'bad' },
+  unsupported: { text: 'Expo Go cannot receive notifications — install the real app', icon: 'alert-circle', tone: 'bad' },
+  'no-project-id': { text: 'This build is missing its Expo project ID', icon: 'alert-circle', tone: 'bad' },
+  'no-token': { text: 'The phone could not get a notification address', icon: 'alert-circle', tone: 'bad' },
+  'server-rejected': { text: 'The server refused to store this device', icon: 'alert-circle', tone: 'bad' },
+  error: { text: 'Registration failed', icon: 'alert-circle', tone: 'bad' },
+};
 
 export default function SettingsScreen() {
   const { session, logout } = useSession();
@@ -26,6 +41,16 @@ export default function SettingsScreen() {
   const styles = useMemo(() => createStyles(colors), [colors]);
   const initial = (session?.displayName || '?').trim().charAt(0).toUpperCase() || '?';
   const [notifsMuted, setNotifsMuted] = useState(false);
+  const [pushStatus, setPushStatus] = useState(null);
+  const [showPushDetail, setShowPushDetail] = useState(false);
+
+  useEffect(() => subscribeToPushStatus(setPushStatus), []);
+
+  const pushInfo = PUSH_STATE_LABEL[pushStatus?.state] || PUSH_STATE_LABEL.idle;
+  const pushTone =
+    pushInfo.tone === 'ok' ? colors.emerald
+    : pushInfo.tone === 'bad' ? colors.red
+    : colors.textFaint;
 
   // Re-read on every focus too, in case it was changed elsewhere (there's
   // no elsewhere today, but this keeps it consistent with how HomeScreen
@@ -118,6 +143,35 @@ export default function SettingsScreen() {
         </View>
       </View>
 
+      {/* Push registration status. Tapping reveals the raw detail — the exact
+          error string, which is what actually gets pasted into a bug report. */}
+      <Text style={styles.sectionLabel}>Diagnostics</Text>
+      <View style={styles.listGroup}>
+        <TouchableOpacity
+          style={styles.listItem}
+          onPress={() => setShowPushDetail((v) => !v)}
+          activeOpacity={0.7}
+        >
+          <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <Ionicons name={pushInfo.icon} size={18} color={pushTone} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.listItemLabel}>Push notifications</Text>
+              <Text style={[styles.listItemHint, { color: pushTone }]}>{pushInfo.text}</Text>
+              {showPushDetail && pushStatus?.detail ? (
+                <Text style={styles.diagnosticDetail} selectable>
+                  {pushStatus.state}: {pushStatus.detail}
+                </Text>
+              ) : null}
+            </View>
+          </View>
+          <Ionicons
+            name={showPushDetail ? 'chevron-up' : 'chevron-down'}
+            size={16}
+            color={colors.textFaint}
+          />
+        </TouchableOpacity>
+      </View>
+
       <View style={styles.listGroup}>
         <View style={styles.listItem}>
           <Text style={styles.listItemLabel}>App version</Text>
@@ -194,6 +248,12 @@ function createStyles(colors) {
   listItemLabel: { fontSize: 13.5, fontWeight: '600', color: colors.text },
   listItemHint: { fontSize: 11.5, color: colors.textFaint, marginTop: 2 },
   listItemValue: { fontSize: 13, color: colors.textMuted, fontWeight: '600' },
+  diagnosticDetail: {
+    fontSize: 11,
+    color: colors.textMuted,
+    marginTop: 6,
+    lineHeight: 15,
+  },
   logoutButton: {
     flexDirection: 'row',
     backgroundColor: colors.redTint,

@@ -38,6 +38,7 @@ import {
 } from '../api/client';
 import { radius, shadow, fileBadgeForName, stageLabelShort } from '../theme';
 import { showAlert } from '../utils/alert';
+import { openAttachment } from '../utils/openAttachment';
 
 export default function ReviewExpenseScreen({ route, navigation }) {
   const { session } = useSession();
@@ -71,44 +72,22 @@ export default function ReviewExpenseScreen({ route, navigation }) {
     }
   }
 
-  // Same download-then-preview pattern as AddEditExpenseScreen — a
-  // reviewer needs to be able to see the receipt before deciding.
+  // Shared with AddEditExpenseScreen via src/utils/openAttachment.js — a
+  // reviewer needs to see the receipt before deciding, and this was previously
+  // a near-copy of that screen's version, which meant the PDF-opening bug had
+  // to be found and fixed twice.
   async function handlePreviewAttachment() {
     setPreviewing(true);
     setError(null);
     try {
       const headers = await getAttachmentDownloadHeaders(empId);
 
-      // See AddEditExpenseScreen: no filesystem or share sheet on web, so
-      // fetch the bytes and use an object URL instead.
-      if (Platform.OS === 'web') {
-        const res = await fetch(getAttachmentUrl(expense.id), { headers });
-        if (!res.ok) throw new Error('Failed to download attachment.');
-        const blob = await res.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        if ((blob.type || '').startsWith('image/')) {
-          setPreviewImageUri(objectUrl);
-        } else {
-          window.open(objectUrl, '_blank');
-        }
-        return;
-      }
-
-      const localUri = FileSystem.cacheDirectory + expense.attachment_filename;
-      const result = await FileSystem.downloadAsync(getAttachmentUrl(expense.id), localUri, { headers });
-      if (result.status !== 200) throw new Error('Failed to download attachment.');
-
-      const contentType = (result.headers['Content-Type'] || result.headers['content-type'] || '').toLowerCase();
-      if (contentType.startsWith('image/')) {
-        setPreviewImageUri(result.uri);
-        return;
-      }
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
-        await Sharing.shareAsync(result.uri, { mimeType: contentType || undefined });
-      } else {
-        showAlert('Preview not available', 'This device has no way to open this file type.');
-      }
+      await openAttachment({
+        url: getAttachmentUrl(expense.id),
+        headers,
+        filename: expense.attachment_filename,
+        onImage: setPreviewImageUri,
+      });
     } catch (e) {
       setError(e.message || 'Failed to preview attachment.');
     } finally {

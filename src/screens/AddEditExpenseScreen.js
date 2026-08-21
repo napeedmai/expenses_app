@@ -38,6 +38,7 @@ import { EXPENSE_TYPES } from '../constants/expenseTypes';
 import { radius, shadow, fileBadgeForName, stageLabel } from '../theme';
 import { Ionicons } from '@expo/vector-icons';
 import { showAlert } from '../utils/alert';
+import { openAttachment } from '../utils/openAttachment';
 import {
   getExpense,
   createDraft,
@@ -60,6 +61,7 @@ const EDITABLE_STATUSES = ['DRAFT', 'REVISION_REQUESTED'];
 // backend requirement (the draft-creation endpoint rejects a request
 // without those three), not a UX choice, so it stays as-is.
 const ALLOWED_ATTACHMENT_EXTENSIONS = ['pdf', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'csv', 'rar'];
+
 const MAX_ATTACHMENT_BYTES = 1 * 1024 * 1024; // 1 MB
 
 // Must match the backend default in 46_currency_endpoints.sql and the
@@ -392,44 +394,12 @@ export default function AddEditExpenseScreen({ route, navigation }) {
     try {
       const headers = await getAttachmentDownloadHeaders(empId);
 
-      // Web has no filesystem to download into (FileSystem.cacheDirectory is
-      // null and downloadAsync is unimplemented), and no OS share sheet.
-      // Fetch the bytes, wrap them in an object URL, and either show the
-      // image inline or hand the file to the browser in a new tab.
-      if (Platform.OS === 'web') {
-        const res = await fetch(getAttachmentUrl(expenseId), { headers });
-        if (!res.ok) throw new Error('Failed to download attachment.');
-        const blob = await res.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        if ((blob.type || '').startsWith('image/')) {
-          setPreviewImageUri(objectUrl);
-        } else {
-          window.open(objectUrl, '_blank');
-        }
-        return;
-      }
-
-      const safeName = (attachmentInfo && attachmentInfo.name) || `attachment-${expenseId}`;
-      const localUri = FileSystem.cacheDirectory + safeName;
-
-      const result = await FileSystem.downloadAsync(getAttachmentUrl(expenseId), localUri, { headers });
-      if (result.status !== 200) {
-        throw new Error('Failed to download attachment.');
-      }
-
-      const contentType = (result.headers['Content-Type'] || result.headers['content-type'] || '').toLowerCase();
-
-      if (contentType.startsWith('image/')) {
-        setPreviewImageUri(result.uri);
-        return;
-      }
-
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
-        await Sharing.shareAsync(result.uri, { mimeType: contentType || undefined });
-      } else {
-        showAlert('Preview not available', 'This device has no way to open this file type.');
-      }
+      await openAttachment({
+        url: getAttachmentUrl(expenseId),
+        headers,
+        filename: (attachmentInfo && attachmentInfo.name) || `attachment-${expenseId}`,
+        onImage: setPreviewImageUri,
+      });
     } catch (e) {
       const message = e.message || 'Failed to preview attachment.';
       setError(message);

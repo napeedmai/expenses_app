@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "748412537409",
+    "project_id": "trinamix-expenses",
+    "storage_bucket": "trinamix-expenses.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:748412537409:android:8fdbec6d4202a8447fd4c0",
+        "android_client_info": {
+          "package_name": "com.trinamix.expenseapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCNhVr3r2x9sOI2ZIQvuFER6W0w0t6B2Wc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

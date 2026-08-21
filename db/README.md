@@ -1,115 +1,130 @@
 # Database scripts
 
-Everything needed to stand up the Expense App backend.
-Read `../DEPLOYMENT.md` first — it explains the values you need, the DBA
-tasks, the verification steps, and the fault dictionary.
+Read `../DEPLOYMENT.md` first — it explains the values to collect, the DBA
+tasks, verification, and the fault dictionary.
+
+Twelve of the files here are numbered fixes written one at a time while
+debugging. **You almost certainly don't need most of them.** This page says
+which.
 
 ---
 
-## Fresh environment
+## If you are deploying to a NEW environment
 
-Run **`MASTER_DEPLOY.sql`** as the application schema. It concatenates the
-eight scripts below in dependency order and is safe to re-run.
+Four files, in this order. Nothing else.
 
-Three things it deliberately cannot do, and login fails without them:
-
-1. **OAuth client + `APP_SECRETS`** — `PROD_2b_oauth_and_network_acl.sql`
-   sections 1–2, then seed `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` and
-   `OAUTH_TOKEN_URL`.
-2. **Network ACL** — `PROD_2b` section 3, run by a DBA, granted to the
-   **APEX engine schema** (not just the app schema). See `DEPLOYMENT.md`
-   §5.1; granting only the app schema does not work.
-3. **`is_finance_manager`** — still returns `'Y'` for one hardcoded
-   `EMPID`. Set it for this environment.
-
-> Before running on a schema with real data: part 5 backfills every existing
-> expense with an **assumed currency** and computes `amount_usd` from it.
-> Irreversible. Check `c_assumed_currency` first.
-
----
-
-## Files
-
-### Included in `MASTER_DEPLOY.sql`
-
-| Order | File | Creates |
+| # | File | Notes |
 |---|---|---|
-| 1 | `PROD_1_schema.sql` | `EXPENSES`, `EXPENSE_APPROVALS`, `EMP_PUSH_TOKENS`, `APP_SECRETS`, session signing key, and the `COMMENT`→`COMMENTS` repair (§2.1) |
-| 2 | `PROD_2_ords_and_security_setup.sql` | ORDS roles, privileges, pattern mappings |
-| 3 | `PROD_3_business_logic.sql` | Session tokens, OAuth fetch, approval workflow, push |
-| 4 | `PROD_4_endpoints.sql` | All ORDS modules, templates, handlers, parameters |
-| 5 | `45_currency_conversion.sql` | Currency columns, `get_exchange_rate`, `convert_to_usd`, backfill |
-| 6 | `46_currency_endpoints.sql` | `/currencies`, `/exchange-rate`, currency-aware save |
-| 7 | `48_rate_month_truthfulness.sql` | `get_rate_effective_date`, honest fallback reporting |
-| 8 | `49_usd_identity.sql` | USD as `1` in code rather than a data row |
+| 1 | `MASTER_DEPLOY.sql` | The entire backend. Every fix below is already folded in |
+| 2 | `PROD_2b_oauth_and_network_acl.sql` | OAuth client (app schema) + network ACL (**DBA**) |
+| 3 | `EMAIL_DEPLOY.sql` | Email notifications. Also included in part 3 of the master, but re-running is harmless and it verifies itself |
+| 4 | `13_cors_fix_for_web_testing.sql` | **Only** if serving from a browser |
 
-Parts 6–8 intentionally replace objects and handlers defined earlier in the
-file. Later definitions win.
+Then `HEALTH_CHECK.sql` to confirm it worked.
 
-### Run separately
+Three things `MASTER_DEPLOY.sql` cannot do, and login fails without them:
 
-| File | When |
+1. **OAuth client + `APP_SECRETS`** — `PROD_2b` sections 1–2
+2. **Network ACL**, granted to the **APEX engine schema** (`APEX_260100` here),
+   not just the app schema — `PROD_2b` section 3, needs a DBA
+3. **`get_finance_manager_empid`** — returns one hardcoded `EMPID`. Set it
+
+> On a schema with existing data, part 5 of the master backfills every expense
+> with an **assumed currency** and computes `amount_usd` from it. Irreversible.
+> Check `c_assumed_currency` first.
+
+---
+
+## If something is broken
+
+| File | Use when |
 |---|---|
-| `PROD_2b_oauth_and_network_acl.sql` | Always — OAuth client (app schema) and network ACL (DBA) |
-| `HEALTH_CHECK.sql` | After deploying, and any time something breaks. Read-only |
-| `13_cors_fix_for_web_testing.sql` | Only if serving the app from a browser. Native apps aren't subject to CORS |
+| `HEALTH_CHECK.sql` | **Start here.** Read-only, safe on production. PASS/FAIL for tables, columns, PL/SQL objects, secrets, every handler, the login guard, privilege coverage, currency direction |
+| `54_diagnose_push_http.sql` | Push fails with `ORA-29273`. Prints the real error underneath it |
+| `DBA_REQUEST_push_wallet.md` | Push fails with `ORA-29024`. Forward this to a DBA |
 
-`HEALTH_CHECK.sql` is read-only and safe on production during business
-hours. Run it as the app schema with `SET SERVEROUTPUT ON`; it prints
-PASS/FAIL/WARN for tables, columns, PL/SQL objects, secrets, every handler,
-the login guard, privilege coverage and the currency direction, with the fix
-for each failure. Run it on **both** environments — most of the trouble in
-this project came from the two drifting apart.
+---
 
-### Remediation — existing environments only
+## Fixes for an ALREADY-DEPLOYED environment
 
-Not needed for a fresh install; each fixes a specific defect found in a
-deployed environment.
+Only needed if that environment predates the fix. All are in
+`MASTER_DEPLOY.sql` already, so a fresh install never needs them.
 
 | File | Fixes |
 |---|---|
 | `47_align_role_names.sql` | ORDS role named differently between environments |
-| `50_fix_login_null_bypass.sql` | Authentication bypass — **already folded into `PROD_4`** |
+| `50_fix_login_null_bypass.sql` | **Authentication bypass** — any password accepted |
 | `51_restore_missing_handlers.sql` | Templates registered with no handler (`whoami`, `:id/accept`) |
+| `52_push_banner_fix.sql` | Push delivered but no banner shown |
+| `53_finance_manager_single_source.sql` | Finance manager's `EMPID` hardcoded in three places |
+| `55_push_wallet.sql` | Teaches the app to use the DBA's wallet |
+| `61_email_manager_has_no_address.sql` | Wrong "no project manager" warning |
+
+`61` is a delta for an environment that already ran `EMAIL_DEPLOY.sql` before
+that fix existed. `EMAIL_DEPLOY.sql` now contains it, so a fresh run doesn't
+need `61`.
+
+### Superseded — kept only for the record
+
+`56`, `57`, `58`, `59`, `60` were the email work, built up one fix at a time.
+**`EMAIL_DEPLOY.sql` contains all of them**, in the only order that compiles.
+Running them individually now risks the ordering trap below. Safe to delete.
 
 ---
 
-## The one thing not to skip
+## Source files
 
-`50_fix_login_null_bypass.sql` corrects a live authentication bypass: any
-valid username with **any password** received a session.
+`PROD_1` … `PROD_4` are what `MASTER_DEPLOY.sql` is generated from. Edit these,
+not the master — the master is regenerated by concatenating them in dependency
+order.
 
-`APEX_UTIL.IS_LOGIN_PASSWORD_VALID` returns **NULL**, not `FALSE`, for a
-wrong password. In PL/SQL `NOT NULL` is NULL, and an `IF` only branches on
-TRUE — so the rejection was skipped entirely and execution fell through to
-the success path:
+| File | Contains |
+|---|---|
+| `PROD_1_schema.sql` | Tables, indexes, `APP_SECRETS`, mail log, session signing key |
+| `PROD_2_ords_and_security_setup.sql` | ORDS roles, module, URI templates, privileges |
+| `PROD_3_business_logic.sql` | Session tokens, OAuth, approval workflow, email, push |
+| `PROD_4_endpoints.sql` | All 21 handlers and their parameters |
+| `45`, `46`, `48`, `49` | The currency feature |
+
+---
+
+## Three traps that have each cost real time
+
+**Wrong schema.** Four scripts went to dev by accident. Dev never received the
+push feature, so `SEND_PUSH_NOTIFICATION` is permanently INVALID there and
+anything calling it fails to compile — surfacing as several unrelated-looking
+`PLS-00905` errors. Always:
 
 ```sql
-IF NOT l_valid THEN ...            -- WRONG: never fires on NULL
-IF NVL(l_valid, FALSE) = FALSE THEN  -- correct
+SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM dual;
 ```
 
-It hides well: `CASE WHEN l_valid THEN 'Y' ELSE 'N' END` renders NULL as
-`'N'`, so the endpoint reported the password as invalid *and issued a token
-in the same response*.
+`EMAIL_DEPLOY.sql` and `HEALTH_CHECK.sql` check this themselves. Ad-hoc
+queries don't.
 
-`PROD_4_endpoints.sql` now carries the fixed guard, so a fresh deployment is
-safe. **Verify it anyway** — test S2 in `DEPLOYMENT.md` §6.2, twice, with a
-manually built header and Postman's auth type set to "No Auth". Postman's
-Basic Auth tab retains the last good password and will hide the failure.
+**Wrong order.** `SEND_EXPENSE_MAIL` must be created *before*
+`PROCESS_EXPENSE_ACTION`. Reversed, the workflow compiles against the older
+4-argument version and rejects the role argument with `PLS-00306`. This is why
+`EMAIL_DEPLOY.sql` exists as one file.
+
+**Retyping an ORDS handler.** `ORDS.DEFINE_HANDLER` replaces the entire body,
+so anything missing from your replacement is silently deleted from the live
+endpoint. Copy handler source from `PROD_4_endpoints.sql` verbatim; never from
+memory. A reconstruction once dropped two emails, a branch and four push calls.
 
 ---
 
 ## After deploying
 
-Work through `DEPLOYMENT.md` §6. The three checks that catch the most:
+Work through `DEPLOYMENT.md` §11. The checks that catch the most:
 
 ```sql
--- 1. Nothing INVALID. A handler referencing an INVALID object fails with a
---    bare 403 or 555 and no body -- it looks like a permissions problem.
+-- 1. Nothing INVALID. A handler referencing an INVALID object returns a bare
+--    403 or 555 with no body -- it reads as a permissions problem.
 SELECT object_name, object_type, status FROM user_objects WHERE status = 'INVALID';
 
--- 2. No template without a handler -- that is a URL that does nothing.
+-- 2. No template without a handler -- that is a URL that answers but runs
+--    nothing.
 SELECT t.uri_template, COUNT(h.id) AS handlers
 FROM   user_ords_templates t
 JOIN   user_ords_modules m ON m.id = t.module_id
@@ -122,13 +137,15 @@ GROUP  BY t.uri_template ORDER BY handlers;
 SELECT pm.pattern FROM user_ords_privilege_mappings pm
 WHERE  pm.pattern LIKE '/expenses/%*%' OR pm.pattern = '/expenses/*';
 
--- 4. Must return exactly COMMENTS. process_expense_action inserts into
---    COMMENTS; if the column is still named COMMENT the procedure stays
---    INVALID and every approval fails with a bare 403/555.
+-- 4. Must return exactly COMMENTS. If it is still COMMENT,
+--    process_expense_action stays INVALID and every approval fails.
 SELECT column_name FROM user_tab_columns
 WHERE  table_name = 'EXPENSE_APPROVALS' AND column_name LIKE 'COMMENT%';
 ```
 
-Then the HTTP tests — S1–S7 and the functional set. The INR conversion check
-matters: getting the direction backwards turns a ₹1,000 taxi fare into an
-$88,648 expense, and nothing else would flag it.
+Then the HTTP tests — S1–S7 in `DEPLOYMENT.md` §11.2. **S2 and S6 are not
+optional.** S2 catches the authentication bypass that once shipped live; S6 is
+what stops `X-Emp-Id` being a way to read anyone's expenses.
+
+And the currency direction check: getting it backwards turns a ₹1,000 taxi
+fare into an $88,648 expense, and nothing else in the system would flag it.

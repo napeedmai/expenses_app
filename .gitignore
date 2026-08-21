@@ -33,6 +33,14 @@ yarn-error.*
 # local env files
 .env*.local
 
+# Firebase / FCM service account key — grants the ability to send push
+# notifications as this project. Must never be committed.
+# NOTE: google-services.json is NOT secret (it holds public identifiers) and
+# SHOULD be committed, or Android builds cannot register with FCM.
+*service-account*.json
+*serviceaccount*.json
+*-firebase-adminsdk-*.json
+
 # typescript
 *.tsbuildinfo
 
@@ -45,3 +53,4 @@ AGENTS.md
 CLAUDE.md
 .claude/
 DEPLOY_WEB_GITHUB_PAGES.md
+deploy-web.ps1

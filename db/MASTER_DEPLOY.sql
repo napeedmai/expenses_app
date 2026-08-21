@@ -1,7 +1,7 @@
 --==============================================================================
 -- MASTER_DEPLOY.sql   --   Expense App, full database deployment
 --
--- Generated 2026-08-14 by concatenating the individual scripts in
+-- Generated 2026-08-17 by concatenating the individual scripts in
 -- this folder, in dependency order. Run as the APPLICATION SCHEMA.
 --
 -- READ DEPLOYMENT.md FIRST -- in particular section 3 (values to collect) and
@@ -44,10 +44,9 @@ SET DEFINE OFF
 SET SERVEROUTPUT ON
 
 
-
 --------------------------------------------------------------------------------
 -- PART 1 of 8   --   PROD_1_schema.sql
--- Tables, indexes, APP_SECRETS, session signing key
+-- Tables, indexes, APP_SECRETS, mail log, session signing key
 --------------------------------------------------------------------------------
 
 
@@ -84,7 +83,10 @@ BEGIN
         status                 VARCHAR2(30)    DEFAULT ''DRAFT'' NOT NULL,
         current_stage          VARCHAR2(20),
         manager_empid          NUMBER,
-        finance_manager_empid  NUMBER          DEFAULT 3680,
+        -- No DEFAULT. The submit handler sets this from
+        -- get_finance_manager_empid(); a literal here would be a second,
+        -- silently diverging source of truth.
+        finance_manager_empid  NUMBER,
         submitted_by           NUMBER,
         submitted_at           TIMESTAMP,
         client_request_id      VARCHAR2(64),
@@ -218,6 +220,39 @@ END;
 /
 
 COMMENT ON TABLE expense_approvals IS 'Append-only audit log — one row per accept/revise/reject action, at either review stage. approver_id references EMPLOYEEDETAILS.EMPID. role is PROJECT_MANAGER or FINANCE_MANAGER (renamed from REPORTING_MANAGER — the first stage now routes via the PROJECT_MANAGER table, not the reporting-manager hierarchy).';
+
+
+--------------------------------------------------------------------------------
+-- 2.2 EXPENSE_MAIL_LOG -- one row per notification email attempt.
+--
+-- Exists because mail failures used to be swallowed by "EXCEPTION WHEN OTHERS
+-- THEN NULL" and were therefore undiagnosable: no mail, no error, no clue.
+-- A failed notification must never roll back the approval that triggered it,
+-- but it must not vanish either.
+--------------------------------------------------------------------------------
+BEGIN
+  EXECUTE IMMEDIATE '
+    CREATE TABLE expense_mail_log (
+      id          NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      expense_id  NUMBER,
+      event       VARCHAR2(30),
+      mail_to     VARCHAR2(4000),
+      mail_cc     VARCHAR2(4000),
+      subject     VARCHAR2(400),
+      status      VARCHAR2(20),
+      error_text  VARCHAR2(4000),
+      created_at  TIMESTAMP DEFAULT SYSTIMESTAMP
+    )';
+EXCEPTION
+  WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE INDEX ix_mail_log_expense ON expense_mail_log(expense_id, created_at)';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+END;
+/
 
 
 --------------------------------------------------------------------------------
@@ -495,18 +530,35 @@ END;
 
 --------------------------------------------------------------------------------
 -- PART 3 of 8   --   PROD_3_business_logic.sql
--- Session tokens, OAuth fetch, approval workflow, push, mail
+-- Session tokens, OAuth, approval workflow, email, push
 --------------------------------------------------------------------------------
 
 
 
 --------------------------------------------------------------------------------
--- Is this EMPID the Finance Manager? Hardcoded to 3680 — the one place to
--- change if a second Finance Manager is ever added.
+-- Who is the Finance Manager, and is this EMPID them?
+--
+-- Still a single hardcoded id. Replace get_finance_manager_empid's body with a
+-- table or role lookup if a second finance manager is ever needed — everything
+-- else calls through it, so nothing else changes.
 --------------------------------------------------------------------------------
+-- >>> THE ONLY PLACE THE FINANCE MANAGER'S EMPID APPEARS <<<
+--
+-- It used to appear in three: this function, the EXPENSES.FINANCE_MANAGER_EMPID
+-- column default, and a literal in the :id/submit handler. Changing only the
+-- function let the new person approve while every expense still displayed and
+-- routed to the old one -- the function answers "who MAY approve", the other two
+-- answered "who is this expense FOR", and they silently disagreed.
+CREATE OR REPLACE FUNCTION get_finance_manager_empid RETURN NUMBER IS
+  c_finance_manager CONSTANT NUMBER := 3725;
+BEGIN
+  RETURN c_finance_manager;
+END get_finance_manager_empid;
+/
+
 CREATE OR REPLACE FUNCTION is_finance_manager(p_emp_id IN NUMBER) RETURN VARCHAR2 IS
 BEGIN
-  RETURN CASE WHEN p_emp_id = 3680 THEN 'Y' ELSE 'N' END;
+  RETURN CASE WHEN p_emp_id = get_finance_manager_empid() THEN 'Y' ELSE 'N' END;
 END is_finance_manager;
 /
 
@@ -830,9 +882,26 @@ CREATE OR REPLACE PROCEDURE send_push_notification(
 BEGIN
   FOR t IN (SELECT push_token FROM emp_push_tokens WHERE emp_id = p_emp_id) LOOP
     BEGIN
+      -- sound/priority/channelId are what make this appear as a BANNER on
+      -- the phone rather than a silent line in the notification drawer.
+      --   priority  'high'             -> FCM delivers immediately instead of
+      --                                   batching it until the device next
+      --                                   wakes, which on a dozing phone can
+      --                                   be many minutes.
+      --   channelId 'expense-updates'  -> must match the channel created in
+      --                                   src/pushNotifications.js. Android 8+
+      --                                   takes the importance (and therefore
+      --                                   whether a banner appears at all)
+      --                                   from the CHANNEL, not the message.
+      --                                   A channelId with no matching channel
+      --                                   on the device falls back to the
+      --                                   default one, silently.
       l_payload := '{"to":"' || json_escape_str(t.push_token) ||
                    '","title":"' || json_escape_str(p_title) ||
-                   '","body":"' || json_escape_str(p_body) || '"' ||
+                   '","body":"' || json_escape_str(p_body) ||
+                   '","sound":"default"' ||
+                   ',"priority":"high"' ||
+                   ',"channelId":"expense-updates"' ||
                    CASE WHEN p_expense_id IS NOT NULL
                         THEN ',"data":{"expenseId":' || p_expense_id || '}'
                         ELSE '' END ||
@@ -864,6 +933,492 @@ END send_push_notification;
 -- Core approval-action logic, shared by the single-item and bulk
 -- accept/revise/reject endpoints (PROD_4_endpoints.sql).
 --------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+-- Mail configuration: sender address and APEX workspace.
+--
+-- The workspace is resolved HERE, at deploy time, rather than hardcoded -- it
+-- differs per environment and a wrong value fails in a way that looks like a
+-- mail server problem. APEX_MAIL.SEND needs it because it requires a security
+-- group id, and an ORDS handler has no APEX session.
+--
+-- EDIT MAIL_FROM if IT specifies a different sender. It must be an address the
+-- mail server will accept, or everything is rejected or filed as spam.
+--------------------------------------------------------------------------------
+DECLARE
+  l_ws VARCHAR2(200);
+  l_n  NUMBER;
+BEGIN
+  SELECT COUNT(DISTINCT workspace_name) INTO l_n
+  FROM   apex_workspace_apex_users
+  WHERE  workspace_name != 'INTERNAL';
+
+  IF l_n = 1 THEN
+    SELECT DISTINCT workspace_name INTO l_ws
+    FROM   apex_workspace_apex_users
+    WHERE  workspace_name != 'INTERNAL';
+
+    MERGE INTO app_secrets t
+    USING (SELECT 'MAIL_WORKSPACE' AS n, l_ws AS v FROM dual) s
+    ON (t.secret_name = s.n)
+    WHEN MATCHED THEN UPDATE SET t.secret_value = s.v
+    WHEN NOT MATCHED THEN INSERT (secret_name, secret_value) VALUES (s.n, s.v);
+
+    DBMS_OUTPUT.PUT_LINE('MAIL_WORKSPACE resolved to: ' || l_ws);
+  ELSE
+    DBMS_OUTPUT.PUT_LINE('Found ' || l_n || ' candidate workspaces -- cannot choose.');
+    DBMS_OUTPUT.PUT_LINE('Set it by hand:');
+    DBMS_OUTPUT.PUT_LINE('  UPDATE app_secrets SET secret_value = ''<WORKSPACE>''');
+    DBMS_OUTPUT.PUT_LINE('  WHERE secret_name = ''MAIL_WORKSPACE'';');
+  END IF;
+END;
+/
+
+-- Sender address. EDIT THIS if IT specifies something different. It must be an
+-- address the mail server will accept as a sender, or everything is rejected
+-- or filed as spam -- which is why the old behaviour of sending AS the acting
+-- employee was a liability rather than a convenience.
+MERGE INTO app_secrets t
+USING (SELECT 'MAIL_FROM' AS n, 'noreply@trinamix.com' AS v FROM dual) s
+ON (t.secret_name = s.n)
+WHEN MATCHED THEN UPDATE SET t.secret_value = s.v
+WHEN NOT MATCHED THEN INSERT (secret_name, secret_value) VALUES (s.n, s.v);
+
+COMMIT;
+
+
+--------------------------------------------------------------------------------
+-- All expense notification email, in one place.
+--
+-- Callers say WHAT happened and WHO did it; this decides who hears about it.
+-- The matrix used to be scattered across six inline APEX_MAIL.SEND calls and
+-- had drifted badly -- on revision and rejection it mailed the managers and
+-- not the employee, the one person who had to act.
+--
+--   EVENT             TO                CC
+--   SUBMITTED         project manager   employee
+--   MANAGER_ACCEPTED  finance manager   project manager + employee
+--   FINANCE_ACCEPTED  employee          project manager
+--   REVISED           employee          project manager, if Finance asked
+--   REJECTED          employee          project manager, if Finance rejected
+--
+-- Requires APP_SECRETS rows MAIL_FROM and MAIL_WORKSPACE -- see
+-- 56_email_notifications.sql section 2, which seeds them. Without
+-- MAIL_WORKSPACE, APEX_MAIL.SEND raises immediately: it needs a security
+-- group id and there is no APEX session in an ORDS handler.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE send_expense_mail(
+  p_expense_id  IN NUMBER,
+  p_event       IN VARCHAR2,
+  p_actor_empid IN NUMBER   DEFAULT NULL,
+  p_comment     IN VARCHAR2 DEFAULT NULL,
+  -- 'PROJECT_MANAGER' | 'FINANCE_MANAGER' | NULL.
+  --
+  -- Passed in because it CANNOT be derived here. is_finance_manager() answers
+  -- "is this person the finance manager", not "which role were they acting in
+  -- just now" -- and when one person is both the project manager and the
+  -- finance manager, those differ. A manager revising at the MANAGER stage was
+  -- labelled FM, and his remark filed under Fin.Manager Remarks.
+  --
+  -- Nor can current_stage be read back: process_expense_action has already
+  -- moved it by the time this runs (to FINANCE on manager-accept, to NULL on
+  -- final approval). The caller knows; it computed get_reviewer_role before
+  -- touching anything.
+  p_actor_role  IN VARCHAR2 DEFAULT NULL
+) IS
+  PRAGMA AUTONOMOUS_TRANSACTION;
+
+  -- expense
+  l_emp_id       NUMBER;
+  l_mgr_id       NUMBER;
+  l_fin_id       NUMBER;
+  l_project_id   NUMBER;
+  l_project_name VARCHAR2(400);
+  l_amount       NUMBER;
+  l_currency     VARCHAR2(3);
+  l_amount_usd   NUMBER;
+  l_exchange_rate NUMBER;
+  l_type         VARCHAR2(100);
+  l_bill_no      VARCHAR2(100);
+  l_submitted_at TIMESTAMP;
+
+  -- people, as "Name(Ecode)"
+  l_emp_label    VARCHAR2(400);
+  l_mgr_label    VARCHAR2(400);
+  l_fin_label    VARCHAR2(400);
+  l_emp_name     VARCHAR2(300);
+  l_mgr_name     VARCHAR2(300);
+  l_fin_name     VARCHAR2(300);
+  l_emp_email    VARCHAR2(255);
+  l_mgr_email    VARCHAR2(255);
+  l_fin_email    VARCHAR2(255);
+
+  -- actor
+  l_no_manager   BOOLEAN := FALSE;
+  l_actor_name   VARCHAR2(300);
+  l_actor_role   VARCHAR2(4);      -- 'PM' | 'FM'
+  l_actor_label  VARCHAR2(400);
+
+  -- remarks
+  l_mgr_remarks  VARCHAR2(4000);
+  l_fin_remarks  VARCHAR2(4000);
+
+  l_to           VARCHAR2(4000);
+  l_cc           VARCHAR2(4000);
+  l_subject      VARCHAR2(400);
+  l_greeting     VARCHAR2(400);
+  l_body         CLOB;
+  l_html         CLOB;
+  l_rows         CLOB;
+  l_from         VARCHAR2(255);
+  l_workspace    VARCHAR2(200);
+
+  FUNCTION secret(p_name IN VARCHAR2) RETURN VARCHAR2 IS
+    l_v VARCHAR2(200);
+  BEGIN
+    SELECT secret_value INTO l_v FROM app_secrets WHERE secret_name = p_name;
+    RETURN l_v;
+  EXCEPTION WHEN NO_DATA_FOUND THEN RETURN NULL;
+  END;
+
+  -- One row of the claim table, in both formats at once, so the two bodies can
+  -- never drift apart.
+  PROCEDURE add_row(p_label IN VARCHAR2, p_value IN VARCHAR2) IS
+  BEGIN
+    l_body := l_body || RPAD(p_label, 22) || NVL(NULLIF(TRIM(p_value), ''), '-') || CHR(10);
+    l_rows := l_rows
+      || '<tr><td style="padding:4px 10px;border:1px solid #ddd;background:#f8fafc;'
+      || 'white-space:nowrap"><b>' || p_label || '</b></td>'
+      || '<td style="padding:4px 10px;border:1px solid #ddd">'
+      || NVL(DBMS_XMLGEN.CONVERT(NULLIF(TRIM(p_value), '')), '-') || '</td></tr>';
+  END;
+
+  -- The USD equivalent stored ON THE ROW at save time, plus the rate used to
+  -- get there -- not a fresh conversion. Restating an approved claim at
+  -- today's rate would make the email disagree with the record.
+  FUNCTION usd_row RETURN VARCHAR2 IS
+  BEGIN
+    IF l_amount_usd IS NULL THEN
+      RETURN NULL;   -- renders as '-'
+    END IF;
+    RETURN TO_CHAR(l_amount_usd) || ' USD'
+           || CASE WHEN l_exchange_rate IS NOT NULL AND NVL(l_currency, 'X') != 'USD'
+                   THEN '   (1 ' || l_currency || ' = ' || TO_CHAR(l_exchange_rate) || ' USD)'
+              END;
+  END;
+
+  PROCEDURE log_it(p_status IN VARCHAR2, p_err IN VARCHAR2 DEFAULT NULL) IS
+  BEGIN
+    INSERT INTO expense_mail_log (expense_id, event, mail_to, mail_cc, subject, status, error_text)
+    VALUES (p_expense_id, p_event, l_to, l_cc, l_subject, p_status, p_err);
+  END;
+
+  -- Drops NULLs, duplicates, and anyone already in TO. Without this, someone
+  -- who is the project manager on their own claim receives the same mail twice.
+  FUNCTION cc_list(p_a IN VARCHAR2, p_b IN VARCHAR2 DEFAULT NULL) RETURN VARCHAR2 IS
+    l_out VARCHAR2(4000);
+    PROCEDURE add(p_e IN VARCHAR2) IS
+    BEGIN
+      IF p_e IS NULL THEN RETURN; END IF;
+      IF UPPER(p_e) = UPPER(NVL(l_to, '~')) THEN RETURN; END IF;
+      IF INSTR(UPPER(NVL(l_out, '')), UPPER(p_e)) > 0 THEN RETURN; END IF;
+      l_out := CASE WHEN l_out IS NULL THEN p_e ELSE l_out || ',' || p_e END;
+    END;
+  BEGIN
+    add(p_a); add(p_b);
+    RETURN l_out;
+  END;
+
+BEGIN
+  ------------------------------------------------------------------------------
+  -- Gather
+  ------------------------------------------------------------------------------
+  SELECT e.emp_id, e.manager_empid, NVL(e.finance_manager_empid, get_finance_manager_empid()),
+         e.project_id, e.amount, e.currency, e.amount_usd, e.exchange_rate,
+         e.type, e.bill_no, e.submitted_at
+  INTO   l_emp_id, l_mgr_id, l_fin_id,
+         l_project_id, l_amount, l_currency, l_amount_usd, l_exchange_rate,
+         l_type, l_bill_no, l_submitted_at
+  FROM   expenses e
+  WHERE  e.id = p_expense_id;
+
+  BEGIN
+    SELECT project_name INTO l_project_name
+    FROM   projectmaster WHERE project_id = l_project_id;
+  EXCEPTION WHEN OTHERS THEN l_project_name := NULL;
+  END;
+
+  FOR r IN (SELECT empid,
+                   first_name || ' ' || last_name AS full_name,
+                   ecode,
+                   company_email
+            FROM   employeedetails
+            WHERE  empid IN (l_emp_id, l_mgr_id, l_fin_id))
+  LOOP
+    -- TRIM because a name built from two padded CHAR columns is all spaces
+    -- when both are empty, and an all-space label renders as a blank table
+    -- cell rather than tripping the NVL fallback in add_row.
+    IF r.empid = l_emp_id THEN
+      l_emp_name  := NULLIF(TRIM(r.full_name), '');
+      l_emp_email := r.company_email;
+      l_emp_label := TRIM(NVL(l_emp_name, 'Employee #' || r.empid)
+                     || CASE WHEN TRIM(r.ecode) IS NOT NULL
+                             THEN '(' || TRIM(r.ecode) || ')' END);
+    END IF;
+    IF r.empid = l_mgr_id THEN
+      l_mgr_name  := NULLIF(TRIM(r.full_name), '');
+      l_mgr_email := r.company_email;
+      l_mgr_label := TRIM(NVL(l_mgr_name, 'Employee #' || r.empid)
+                     || CASE WHEN TRIM(r.ecode) IS NOT NULL
+                             THEN '(' || TRIM(r.ecode) || ')' END);
+    END IF;
+    IF r.empid = l_fin_id THEN
+      l_fin_name  := NULLIF(TRIM(r.full_name), '');
+      l_fin_email := r.company_email;
+      l_fin_label := TRIM(NVL(l_fin_name, 'Employee #' || r.empid)
+                     || CASE WHEN TRIM(r.ecode) IS NOT NULL
+                             THEN '(' || TRIM(r.ecode) || ')' END);
+    END IF;
+  END LOOP;
+
+  -- If a lookup found nothing at all, say so rather than leaving the row
+  -- blank. A blank cell reads as a template bug; "Employee #3725 (not found)"
+  -- points at the actual problem, which is the EMPLOYEEDETAILS row.
+  l_emp_label := NVL(l_emp_label, 'Employee #' || l_emp_id || ' (not found)');
+  l_mgr_label := NVL(l_mgr_label, CASE WHEN l_mgr_id IS NULL THEN 'not assigned'
+                                       ELSE 'Employee #' || l_mgr_id || ' (not found)' END);
+  l_fin_label := NVL(l_fin_label, CASE WHEN l_fin_id IS NULL THEN 'not assigned'
+                                       ELSE 'Employee #' || l_fin_id || ' (not found)' END);
+
+  -- Actor. is_finance_manager decides the role rather than comparing against
+  -- manager_empid, because the same person can be both on different claims.
+  IF p_actor_empid IS NOT NULL THEN
+    l_actor_role :=
+      CASE
+        WHEN p_actor_role = 'FINANCE_MANAGER' THEN 'FM'
+        WHEN p_actor_role = 'PROJECT_MANAGER' THEN 'PM'
+        -- No role supplied: fall back to the event, which is unambiguous for
+        -- every case except a revise/reject, where the caller must supply it.
+        WHEN p_event = 'FINANCE_ACCEPTED'     THEN 'FM'
+        WHEN p_event = 'MANAGER_ACCEPTED'     THEN 'PM'
+        ELSE 'PM'
+      END;
+    IF p_actor_empid = l_emp_id THEN
+      l_actor_name := l_emp_name;
+    ELSIF p_actor_empid = l_mgr_id THEN
+      l_actor_name := l_mgr_name;
+    ELSIF p_actor_empid = l_fin_id THEN
+      l_actor_name := l_fin_name;
+    ELSE
+      BEGIN
+        SELECT first_name || ' ' || last_name INTO l_actor_name
+        FROM   employeedetails WHERE empid = p_actor_empid;
+      EXCEPTION WHEN OTHERS THEN l_actor_name := 'Employee #' || p_actor_empid;
+      END;
+    END IF;
+  END IF;
+
+  -- Remarks: the most recent comment at each stage, from the audit trail --
+  -- so an approval email can quote what the manager said earlier.
+  BEGIN
+    SELECT MAX(comments) KEEP (DENSE_RANK LAST ORDER BY acted_at)
+    INTO   l_mgr_remarks
+    FROM   expense_approvals
+    WHERE  expense_id = p_expense_id AND role = 'PROJECT_MANAGER';
+  EXCEPTION WHEN OTHERS THEN l_mgr_remarks := NULL;
+  END;
+
+  BEGIN
+    SELECT MAX(comments) KEEP (DENSE_RANK LAST ORDER BY acted_at)
+    INTO   l_fin_remarks
+    FROM   expense_approvals
+    WHERE  expense_id = p_expense_id AND role = 'FINANCE_MANAGER';
+  EXCEPTION WHEN OTHERS THEN l_fin_remarks := NULL;
+  END;
+
+  -- p_comment is the action just performed; it may not be committed to
+  -- EXPENSE_APPROVALS yet from this autonomous transaction's point of view.
+  IF p_comment IS NOT NULL THEN
+    IF l_actor_role = 'FM' THEN l_fin_remarks := p_comment;
+    ELSE                        l_mgr_remarks := p_comment;
+    END IF;
+  END IF;
+
+  ------------------------------------------------------------------------------
+  -- Recipients, greeting, subject
+  ------------------------------------------------------------------------------
+  IF p_event = 'SUBMITTED' THEN
+    IF l_mgr_email IS NOT NULL THEN
+      l_to        := l_mgr_email;
+      l_cc        := cc_list(l_emp_email);
+      l_greeting  := 'Dear ' || NVL(l_mgr_name, 'Project Manager');
+      l_subject   := 'Expense #' || p_expense_id || ' awaiting your approval';
+    ELSE
+      -- No project manager to send to. Previously this produced silence: TO
+      -- was NULL, the mail was logged SKIPPED, and the person who submitted
+      -- the claim had no way to know it had gone nowhere. Tell THEM instead.
+      -- The underlying problem is data -- the project has no PROJECT_MANAGER
+      -- row, or that manager has no EMPLOYEEDETAILS record -- and it also
+      -- means nobody can approve the claim at the first stage.
+      l_to        := l_emp_email;
+      l_cc        := NULL;
+      l_greeting  := 'Dear ' || NVL(l_emp_name, 'Colleague');
+      l_subject   := 'Expense #' || p_expense_id
+                     || ' submitted -- no project manager assigned';
+      l_no_manager := TRUE;
+    END IF;
+    l_actor_label := NVL(l_emp_name, 'the submitter');
+
+  ELSIF p_event = 'MANAGER_ACCEPTED' THEN
+    l_to        := l_fin_email;
+    l_cc        := cc_list(l_mgr_email, l_emp_email);
+    l_greeting  := 'Dear ' || NVL(l_fin_name, 'Finance Manager');
+    l_actor_label := NVL(l_actor_name, l_mgr_name) || ' (PM)';
+    l_subject   := 'Expense #' || p_expense_id || ' awaiting Finance approval';
+
+  ELSIF p_event = 'FINANCE_ACCEPTED' THEN
+    l_to        := l_emp_email;
+    l_cc        := cc_list(l_mgr_email);
+    l_greeting  := 'Dear ' || NVL(l_emp_name, 'Colleague');
+    l_actor_label := NVL(l_actor_name, l_fin_name) || ' (FM)';
+    l_subject   := 'Expense #' || p_expense_id || ' approved';
+
+  ELSIF p_event IN ('REVISED', 'REJECTED') THEN
+    l_to        := l_emp_email;
+    l_cc        := cc_list(l_mgr_email);
+    l_greeting  := 'Dear ' || NVL(l_emp_name, 'Colleague');
+    l_actor_label := NVL(l_actor_name, 'a reviewer') || ' (' || NVL(l_actor_role, 'PM') || ')';
+    l_subject   := 'Expense #' || p_expense_id ||
+                   CASE WHEN p_event = 'REVISED' THEN ' sent back for revision'
+                        ELSE ' rejected' END;
+  ELSE
+    l_subject := 'Unknown event ' || p_event;
+    log_it('SKIPPED', 'Unrecognised event');
+    COMMIT; RETURN;
+  END IF;
+
+  IF l_to IS NULL THEN
+    log_it('SKIPPED', 'No TO address -- the relevant employee has no COMPANY_EMAIL');
+    COMMIT; RETURN;
+  END IF;
+
+  ------------------------------------------------------------------------------
+  -- Claim table
+  ------------------------------------------------------------------------------
+  l_body := l_greeting || CHR(10) || CHR(10)
+         || 'This e-mail generated based on action performed by '
+         || l_actor_label || '.' || CHR(10) || CHR(10)
+         || 'Expense Claim' || CHR(10)
+         || RPAD('-', 60, '-') || CHR(10);
+  l_rows := NULL;
+
+  add_row('Project Name:', l_project_name);
+
+  IF p_event = 'SUBMITTED' THEN
+    add_row('Claim Date:', TO_CHAR(NVL(CAST(l_submitted_at AS DATE), SYSDATE), 'DD-Mon-YYYY'));
+    add_row('Claim For:', l_type);
+    add_row('bill no:', l_bill_no);
+    add_row('Currency:', l_currency);
+    add_row('Claim Amount:', TO_CHAR(l_amount) || ' ' || l_currency);
+    add_row('Amount (USD):', usd_row);
+  ELSE
+    add_row('Employee(Ecode):', l_emp_label);
+    add_row('Manager (Ecode):', l_mgr_label);
+    add_row('Fin.Mgr(Ecode):', l_fin_label);
+    add_row('Claim For:', l_type);
+    add_row('bill no:', l_bill_no);
+    add_row('Currency:', l_currency);
+    add_row('bill Amount:', TO_CHAR(l_amount) || ' ' || l_currency);
+    add_row('Amount (USD):', usd_row);
+
+    IF p_event = 'FINANCE_ACCEPTED' THEN
+      add_row('Manager Remarks:', l_mgr_remarks);
+      add_row('Fin.Manager Remarks:', l_fin_remarks);
+      add_row('Approved Amount:', TO_CHAR(l_amount) || ' ' || l_currency
+                                  || CASE WHEN l_amount_usd IS NOT NULL
+                                          THEN '  (USD ' || TO_CHAR(l_amount_usd) || ')' END);
+    ELSIF p_event = 'MANAGER_ACCEPTED' THEN
+      add_row('Manager Remarks:', l_mgr_remarks);
+    ELSE
+      -- REVISED / REJECTED: label the remark with whoever actually acted.
+      add_row(CASE WHEN l_actor_role = 'FM' THEN 'Fin.Manager Remarks:'
+                   ELSE 'Manager Remarks:' END,
+              NVL(p_comment, CASE WHEN l_actor_role = 'FM' THEN l_fin_remarks
+                                  ELSE l_mgr_remarks END));
+    END IF;
+  END IF;
+
+  IF l_no_manager THEN
+    l_body := l_body || CHR(10)
+      || 'NOTE: this claim has no project manager assigned, so it cannot be'  || CHR(10)
+      || 'approved at the first stage. Ask for a project manager to be set on' || CHR(10)
+      || 'the project, then resubmit.' || CHR(10);
+    l_rows := l_rows
+      || '<tr><td colspan="2" style="padding:8px 10px;border:1px solid #f59e0b;'
+      || 'background:#fef3c7;color:#92400e"><b>No project manager is assigned '
+      || 'to this project</b>, so this claim cannot be approved at the first '
+      || 'stage. Ask for one to be set, then resubmit.</td></tr>';
+  END IF;
+
+  l_body := l_body || CHR(10)
+         || 'Open the Expenses app to view or act on this claim.' || CHR(10);
+
+  l_html := '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#0f172a">'
+         || '<p>' || DBMS_XMLGEN.CONVERT(l_greeting) || '</p>'
+         || '<p>This e-mail generated based on action performed by <b>'
+         || DBMS_XMLGEN.CONVERT(l_actor_label) || '</b>.</p>'
+         || '<p style="font-weight:700;margin-bottom:6px">Expense Claim</p>'
+         || '<table style="border-collapse:collapse;border:1px solid #ddd">'
+         || l_rows
+         || '</table>'
+         || '<p style="color:#64748b;font-size:12px">Open the Expenses app to '
+         || 'view or act on this claim.</p></div>';
+
+  ------------------------------------------------------------------------------
+  -- Send
+  ------------------------------------------------------------------------------
+  l_from      := NVL(secret('MAIL_FROM'), 'noreply@trinamix.com');
+  l_workspace := secret('MAIL_WORKSPACE');
+
+  BEGIN
+    IF l_workspace IS NOT NULL THEN
+      APEX_UTIL.SET_WORKSPACE(p_workspace => l_workspace);
+    END IF;
+
+    APEX_MAIL.SEND(
+      p_to        => l_to,
+      p_cc        => l_cc,
+      p_from      => l_from,
+      p_subj      => l_subject,
+      p_body      => l_body,
+      p_body_html => l_html
+    );
+
+    log_it('QUEUED');
+    APEX_MAIL.PUSH_QUEUE;      -- SEND only queues; this hands it to the server
+
+    UPDATE expense_mail_log SET status = 'PUSHED'
+    WHERE  id = (SELECT MAX(id) FROM expense_mail_log
+                 WHERE expense_id = p_expense_id AND event = p_event);
+    COMMIT;
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      log_it('FAILED', SUBSTR(DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 4000));
+      COMMIT;
+  END;
+
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    l_subject := 'Expense ' || p_expense_id || ' not found';
+    log_it('SKIPPED', 'No such expense');
+    COMMIT;
+  WHEN OTHERS THEN
+    log_it('FAILED', SUBSTR(DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 4000));
+    COMMIT;
+END send_expense_mail;
+/
+
+
 CREATE OR REPLACE PROCEDURE process_expense_action(
   p_expense_id  IN  NUMBER,
   p_emp_id      IN  NUMBER,
@@ -914,6 +1469,11 @@ BEGIN
     IF l_role = 'PROJECT_MANAGER' THEN
       UPDATE expenses SET current_stage = 'FINANCE' WHERE id = p_expense_id;
 
+      -- Previously this transition sent NO email at all -- the finance
+      -- manager was told by push only, so with push unavailable nobody
+      -- knew a claim was waiting for them.
+      send_expense_mail(p_expense_id, 'MANAGER_ACCEPTED', p_emp_id, p_comment, l_role);
+
       send_push_notification(l_emp_owner, 'Approved by Manager',
         'Your expense #' || p_expense_id || ' was approved by your project manager — now with Finance.', p_expense_id);
       IF l_finance_empid IS NOT NULL THEN
@@ -924,25 +1484,7 @@ BEGIN
     ELSE -- FINANCE_MANAGER accepting = final approval
       UPDATE expenses SET status = 'APPROVED', current_stage = NULL WHERE id = p_expense_id;
 
-      BEGIN
-        SELECT company_email INTO l_emp_email FROM employeedetails WHERE empid = l_emp_owner;
-        IF l_manager_empid IS NOT NULL THEN
-          SELECT company_email INTO l_mgr_email FROM employeedetails WHERE empid = l_manager_empid;
-        END IF;
-
-        IF l_emp_email IS NOT NULL THEN
-          APEX_MAIL.SEND(p_to => l_emp_email, p_from => l_emp_email,
-            p_subj => 'Expense #' || p_expense_id || ' approved',
-            p_body => 'Your expense has been fully approved by Finance.');
-        END IF;
-        IF l_mgr_email IS NOT NULL THEN
-          APEX_MAIL.SEND(p_to => l_mgr_email, p_from => l_emp_email,
-            p_subj => 'Expense #' || p_expense_id || ' approved',
-            p_body => 'An expense you approved has now been fully approved by Finance.');
-        END IF;
-      EXCEPTION
-        WHEN OTHERS THEN NULL;
-      END;
+      send_expense_mail(p_expense_id, 'FINANCE_ACCEPTED', p_emp_id, p_comment, l_role);
 
       send_push_notification(l_emp_owner, 'Expense Approved',
         'Your expense #' || p_expense_id || ' was fully approved.', p_expense_id);
@@ -951,27 +1493,9 @@ BEGIN
   ELSIF p_action = 'REVISED' THEN
     UPDATE expenses SET status = 'REVISION_REQUESTED' WHERE id = p_expense_id;
 
-    BEGIN
-      IF l_manager_empid IS NOT NULL THEN
-        SELECT company_email INTO l_mgr_email FROM employeedetails WHERE empid = l_manager_empid;
-      END IF;
-      IF l_finance_empid IS NOT NULL THEN
-        SELECT company_email INTO l_fin_email FROM employeedetails WHERE empid = l_finance_empid;
-      END IF;
-
-      IF l_mgr_email IS NOT NULL THEN
-        APEX_MAIL.SEND(p_to => l_mgr_email, p_from => NVL(l_fin_email, l_mgr_email),
-          p_subj => 'Expense #' || p_expense_id || ' sent back for revision',
-          p_body => 'Comment: ' || NVL(p_comment, '(none)'));
-      END IF;
-      IF l_fin_email IS NOT NULL THEN
-        APEX_MAIL.SEND(p_to => l_fin_email, p_from => l_fin_email,
-          p_subj => 'Expense #' || p_expense_id || ' sent back for revision',
-          p_body => 'Comment: ' || NVL(p_comment, '(none)'));
-      END IF;
-    EXCEPTION
-      WHEN OTHERS THEN NULL;
-    END;
+    -- Was mailed to the manager and Finance, and NOT to the employee -- the
+    -- one person who has to act on it.
+    send_expense_mail(p_expense_id, 'REVISED', p_emp_id, p_comment, l_role);
 
     send_push_notification(l_emp_owner, 'Revision Needed',
       'Your expense #' || p_expense_id || ' needs changes before it can be approved.' ||
@@ -981,27 +1505,8 @@ BEGIN
   ELSIF p_action = 'REJECTED' THEN
     UPDATE expenses SET status = 'REJECTED', current_stage = NULL WHERE id = p_expense_id;
 
-    BEGIN
-      IF l_manager_empid IS NOT NULL THEN
-        SELECT company_email INTO l_mgr_email FROM employeedetails WHERE empid = l_manager_empid;
-      END IF;
-      IF l_finance_empid IS NOT NULL THEN
-        SELECT company_email INTO l_fin_email FROM employeedetails WHERE empid = l_finance_empid;
-      END IF;
-
-      IF l_mgr_email IS NOT NULL THEN
-        APEX_MAIL.SEND(p_to => l_mgr_email, p_from => NVL(l_fin_email, l_mgr_email),
-          p_subj => 'Expense #' || p_expense_id || ' rejected',
-          p_body => 'Comment: ' || NVL(p_comment, '(none)'));
-      END IF;
-      IF l_fin_email IS NOT NULL THEN
-        APEX_MAIL.SEND(p_to => l_fin_email, p_from => l_fin_email,
-          p_subj => 'Expense #' || p_expense_id || ' rejected',
-          p_body => 'Comment: ' || NVL(p_comment, '(none)'));
-      END IF;
-    EXCEPTION
-      WHEN OTHERS THEN NULL;
-    END;
+    -- Same fix: the employee was never told their claim was rejected.
+    send_expense_mail(p_expense_id, 'REJECTED', p_emp_id, p_comment, l_role);
 
     send_push_notification(l_emp_owner, 'Expense Rejected',
       'Your expense #' || p_expense_id || ' was rejected.' ||
@@ -1739,35 +2244,19 @@ BEGIN
 
         IF l_status = 'DRAFT' THEN
           l_manager_id := get_project_manager_empid(l_project_id);
+          l_finance_id := get_finance_manager_empid();
 
           UPDATE expenses
           SET status = 'SUBMITTED',
               current_stage = 'MANAGER',
               manager_empid = l_manager_id,
-              finance_manager_empid = 3680,
+              finance_manager_empid = l_finance_id,
               submitted_by = l_emp_id,
               submitted_at = SYSTIMESTAMP
           WHERE id = :id;
 
-          BEGIN
-            SELECT company_email INTO l_emp_email FROM employeedetails WHERE empid = l_emp_id;
-            IF l_manager_id IS NOT NULL THEN
-              SELECT company_email INTO l_mgr_email FROM employeedetails WHERE empid = l_manager_id;
-            END IF;
-
-            IF l_emp_email IS NOT NULL THEN
-              APEX_MAIL.SEND(p_to => l_emp_email, p_from => l_emp_email,
-                p_subj => 'Expense #' || :id || ' submitted',
-                p_body => 'Your expense has been submitted for approval.');
-            END IF;
-            IF l_mgr_email IS NOT NULL THEN
-              APEX_MAIL.SEND(p_to => l_mgr_email, p_from => l_emp_email,
-                p_subj => 'Expense #' || :id || ' awaiting your approval',
-                p_body => 'An expense has been submitted and needs your review.');
-            END IF;
-          EXCEPTION
-            WHEN OTHERS THEN NULL;
-          END;
+          -- TO the project manager, CC the employee. See send_expense_mail.
+          send_expense_mail(:id, 'SUBMITTED', l_emp_id);
 
           send_push_notification(l_emp_id, 'Expense Submitted',
             'Your expense #' || :id || ' was submitted for approval.', :id);

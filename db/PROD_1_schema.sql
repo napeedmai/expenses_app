@@ -32,7 +32,10 @@ BEGIN
         status                 VARCHAR2(30)    DEFAULT ''DRAFT'' NOT NULL,
         current_stage          VARCHAR2(20),
         manager_empid          NUMBER,
-        finance_manager_empid  NUMBER          DEFAULT 3680,
+        -- No DEFAULT. The submit handler sets this from
+        -- get_finance_manager_empid(); a literal here would be a second,
+        -- silently diverging source of truth.
+        finance_manager_empid  NUMBER,
         submitted_by           NUMBER,
         submitted_at           TIMESTAMP,
         client_request_id      VARCHAR2(64),
@@ -166,6 +169,39 @@ END;
 /
 
 COMMENT ON TABLE expense_approvals IS 'Append-only audit log — one row per accept/revise/reject action, at either review stage. approver_id references EMPLOYEEDETAILS.EMPID. role is PROJECT_MANAGER or FINANCE_MANAGER (renamed from REPORTING_MANAGER — the first stage now routes via the PROJECT_MANAGER table, not the reporting-manager hierarchy).';
+
+
+--------------------------------------------------------------------------------
+-- 2.2 EXPENSE_MAIL_LOG -- one row per notification email attempt.
+--
+-- Exists because mail failures used to be swallowed by "EXCEPTION WHEN OTHERS
+-- THEN NULL" and were therefore undiagnosable: no mail, no error, no clue.
+-- A failed notification must never roll back the approval that triggered it,
+-- but it must not vanish either.
+--------------------------------------------------------------------------------
+BEGIN
+  EXECUTE IMMEDIATE '
+    CREATE TABLE expense_mail_log (
+      id          NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      expense_id  NUMBER,
+      event       VARCHAR2(30),
+      mail_to     VARCHAR2(4000),
+      mail_cc     VARCHAR2(4000),
+      subject     VARCHAR2(400),
+      status      VARCHAR2(20),
+      error_text  VARCHAR2(4000),
+      created_at  TIMESTAMP DEFAULT SYSTIMESTAMP
+    )';
+EXCEPTION
+  WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE INDEX ix_mail_log_expense ON expense_mail_log(expense_id, created_at)';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF;
+END;
+/
 
 
 --------------------------------------------------------------------------------

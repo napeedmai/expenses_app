@@ -92,7 +92,7 @@ expense-app/
 │   ├── PROD_1..PROD_4       schema / ORDS setup / business logic / endpoints
 │   ├── PROD_2b_*.sql        OAuth client + network ACL — run separately, needs a DBA
 │   ├── 45,46,48,49_*.sql    the currency feature (included in MASTER_DEPLOY)
-│   ├── 47,50,51_*.sql       remediation for already-deployed environments
+│   ├── 47,50,51,52,53_*.sql remediation for already-deployed environments
 │   └── 13_cors_*.sql        only if serving from a browser
 ├── App.js                   providers, and the login-vs-app switch
 ├── index.js                 Expo entry point
@@ -111,6 +111,7 @@ expense-app/
     │   └── PickerField.js   dropdown used for project, type, currency
     ├── constants/expenseTypes.js  the expense-type list (client-side)
     ├── utils/alert.js       Alert.alert on native, window.confirm on web
+    ├── utils/openAttachment.js  download + open a receipt, per platform
     └── screens/
         ├── LoginScreen.js
         ├── HomeScreen.js            dashboard, monthly totals in USD
@@ -313,7 +314,74 @@ second one. This exists because a request can time out after the server has
 already committed — the app's 45-second timeout says "check My Expenses
 before retrying" for exactly this reason.
 
-### 6.5 Push notifications
+### 6.5 Email notifications
+
+Every notification goes through one procedure, `send_expense_mail`, which
+decides recipients from the event and the actor. The matrix:
+
+| Event | TO | CC |
+|---|---|---|
+| `SUBMITTED` | project manager | employee |
+| `MANAGER_ACCEPTED` | finance manager | project manager + employee |
+| `FINANCE_ACCEPTED` | employee | project manager |
+| `REVISED` | employee | project manager |
+| `REJECTED` | employee | project manager |
+
+Each mail carries an Expense Claim table — project, employee / manager /
+finance names with ecodes, type, bill no, currency, amount, the USD equivalent
+with the rate that was actually used, and the relevant remarks. HTML with a
+plain-text fallback.
+
+**Deploy it with `db/EMAIL_DEPLOY.sql`** — one file, correct order, refuses to
+run on the wrong schema. Scripts 56–61 are the same work in the order it was
+discovered; `EMAIL_DEPLOY.sql` supersedes them.
+
+Three things that are easy to get wrong here:
+
+- **`send_expense_mail` must be created before `process_expense_action`.**
+  Reversed, the workflow compiles against the older 4-argument version and
+  rejects the role argument with `PLS-00306`.
+- **The actor's role is passed in, not derived.** `is_finance_manager()`
+  answers "is this person the finance manager", not "which role were they
+  acting in just now". When one person holds both, those differ —
+  `process_expense_action` passes `get_reviewer_role`'s answer, which is
+  derived from the stage and is the only correct source.
+- **No address is not the same as no manager.** A claim whose manager has no
+  `COMPANY_EMAIL` can still be approved; only the notification is lost. A
+  claim with no `MANAGER_EMPID` is genuinely stuck. The emails say different
+  things for each — see script 61 section 2 for who is affected.
+
+**Three things are required for any mail to leave the database**, and all
+three were missing originally, which is why nothing ever arrived:
+
+1. **`APEX_MAIL.PUSH_QUEUE`.** `APEX_MAIL.SEND` does not send — it writes to
+   `APEX_MAIL_QUEUE`. Without a push, or APEX's background flush job, mail
+   sits there forever while the application believes it sent.
+2. **A workspace.** `APEX_MAIL.SEND` needs a security group id. There is no
+   APEX session inside an ORDS handler, so `APEX_UTIL.SET_WORKSPACE` must be
+   called first — the workspace name is seeded into `APP_SECRETS` at deploy
+   time as `MAIL_WORKSPACE`.
+3. **An SMTP host** configured at APEX instance level, plus a network ACL for
+   it. `56_email_notifications.sql` section 4 reports whether it is set.
+
+Failures are written to **`EXPENSE_MAIL_LOG`**, never swallowed:
+
+```sql
+SELECT created_at, event, status, mail_to, mail_cc, error_text
+FROM   expense_mail_log ORDER BY id DESC FETCH FIRST 20 ROWS ONLY;
+```
+
+`PUSHED` means it reached the mail server. `FAILED` carries the full error
+stack. `SKIPPED` almost always means a missing `COMPANY_EMAIL`. If rows say
+`PUSHED` and nothing arrives, the problem is past the database — SMTP, its
+ACL, or spam filtering of the `MAIL_FROM` address.
+
+> A mail failure must never roll back the approval that triggered it, so the
+> procedure is autonomous and swallows errors *after logging them*. The
+> original code swallowed them without logging, which is what made this
+> undiagnosable.
+
+### 6.6 Push notifications
 
 Expo push, sent from PL/SQL via `APEX_WEB_SERVICE` to Expo's API. Devices
 register through `POST /expenses/push-token`. Expo Go cannot receive remote
@@ -526,7 +594,7 @@ eas build --profile preview      --platform android  # installable APK, no store
 `API_BASE_URL` is baked in at build time — a build points at one environment
 for life. Push notifications need a development build, not Expo Go.
 
-For store releases see [§10.6](#106-releasing-to-the-app-store-and-play-store).
+For store releases see [§10.7](#107-releasing-to-the-app-store-and-play-store).
 iOS has no `preview` device build here: `preview` produces a simulator
 build, and on-device iOS testing goes through TestFlight.
 
@@ -574,7 +642,104 @@ is already handled; keep the pattern when adding features:
 | `FormData` file upload | needs a real `Blob` | `client.js` `uploadAttachment` |
 | `FileSystem.cacheDirectory` | `null` | attachment preview branches on `Platform.OS` |
 
-### 10.6 Releasing to the App Store and Play Store
+### 10.6 Push notification credentials
+
+The backend has been sending pushes since long before any device could receive
+one. Getting a token requires per-platform credentials that live on EAS, not
+in this repo.
+
+**The symptom when they are missing** (Android):
+
+```
+Default FirebaseApp is not initialized in this process com.trinamix.expenseapp.
+Make sure to call FirebaseApp.initializeApp(Context) first.
+```
+
+That is not an app bug. Expo push on Android is delivered *through* Firebase
+Cloud Messaging, so the build needs a Firebase project even though no
+Firebase code is used anywhere.
+
+**Android — four steps, all required:**
+
+1. Create a Firebase project at `console.firebase.google.com`, and add an
+   **Android app** with package name **`com.trinamix.expenseapp`**. It must
+   match `app.json` exactly.
+2. Download **`google-services.json`**, put it in the project root, and point
+   `app.json` at it:
+
+   ```json
+   "android": {
+     "googleServicesFile": "./google-services.json"
+   }
+   ```
+
+   Commit this file. It contains public identifiers, not secrets, and builds
+   fail without it.
+3. In Firebase: **Project settings → Service accounts → Generate new private
+   key**. Upload that JSON to EAS:
+
+   ```bash
+   eas credentials
+   # Android > production > Google Service Account
+   #   > Manage your Google Service Account Key for Push Notifications (FCM V1)
+   #   > Set up ... > Upload a new service account key
+   ```
+
+   **Do not commit this one** — it grants the ability to send push
+   notifications as this project. `.gitignore` already excludes the usual
+   filenames.
+4. Rebuild. Credentials are baked in at build time, so no existing build will
+   ever start working.
+
+> If pushes still fail after this, check whether the API key in
+> `google-services.json` is restricted, in the Google Cloud console. It needs
+> the **FCM Registration API** and **Firebase Installations API** allowed, and
+> any Android app restriction must use the SHA-1 from Play Console →
+> **App Integrity → App signing key certificate** — not the upload key. A
+> mismatch returns `403 PERMISSION_DENIED` and the app never gets a token.
+
+**iOS —** needs a **paid** Apple Developer account; there is no free path.
+Register the test device with EAS *before* the first build, then answer yes to
+"Setup Push Notifications" when `eas build` prompts, or run `eas credentials`
+and generate an Apple Push Notifications service key.
+
+#### Push is optional — current status: NOT ENABLED
+
+As of August 2026 push does not work in production, and **the app is fully
+usable without it**. Do not treat this as a launch blocker.
+
+Where it got to: the Firebase side is done and devices register successfully
+(`EMP_PUSH_TOKENS` fills up). The remaining failure is the database being
+unable to complete a TLS handshake with `exp.host`:
+
+```
+ORA-29273: HTTP request failed
+ORA-29024: Certificate validation failure
+```
+
+The network ACL is correct; the database has no public CA in its trust store.
+Fixing it needs a DBA to build an Oracle wallet — see
+`db/DBA_REQUEST_push_wallet.md`, which is written and ready to send, and
+`db/55_push_wallet.sql`, which wires it up afterwards. Nothing else is
+outstanding.
+
+**What happens meanwhile.** Failures are swallowed by design —
+`send_push_notification` cannot roll back the approval that triggered it — so
+every workflow action still completes normally. Users get:
+
+- **Email** on all five workflow events, including the manager-accept
+  transition that used to be push-only — see the matrix in
+  [§6.5](#65-email-notifications).
+- **The in-app notification list**, which reads from the API and needs nothing
+  external.
+
+Email now covers every event push would have, so nobody is left uninformed
+with push disabled — provided the SMTP host is configured.
+
+If push is never enabled, nothing needs to be removed — the calls are already
+harmless no-ops.
+
+### 10.7 Releasing to the App Store and Play Store
 
 #### What is already configured
 
@@ -760,6 +925,272 @@ Store distribution does not replace these:
 - **APK** — `eas build --profile preview --platform android` gives a
   directly installable file for MDM or a download link. Useful for testing
   the exact production flow before committing to a store review.
+
+### 10.8 Walkthrough: launching as a Custom App (iOS) — THE CHOSEN ROUTE
+
+**Decision, August 2026: iOS ships as a private Custom App, distributed by
+redemption code. Not the public App Store, and not via MDM.**
+
+Why: the app is useless to anyone outside Trinamix, so a public listing risks
+rejection under Guideline 4.2 (Minimum Functionality) and needlessly
+advertises a login endpoint that has no rate limiting. Redemption codes rather
+than MDM because Trinamix does not need to manage the devices — codes work on
+personal iPhones with personal Apple IDs.
+
+The whole journey below, from nothing to the app on an employee's phone. A
+Custom App is distributed only to named organisations instead of the public
+App Store — Apple's own description is "a proprietary app for your
+organisation's internal use".
+
+```
+  Trinamix                 Apple                    You                  Employee
+     │                       │                       │                      │
+  ┌──┴──┐                 ┌──┴──┐                    │                      │
+  │ ABM │──Org ID────────>│     │<──app record───────┤                      │
+  └─────┘                 │     │<──build────────────┤                      │
+                          │Review│                                          │
+                          └──┬──┘                                           │
+                             │ approved                                     │
+                             v                                              │
+                     appears in Trinamix's ABM ──MDM or redeem code────────>│
+```
+
+**Two one-way doors. Read these before starting.**
+
+1. **Private vs Public must be chosen before the app is approved.** Apple:
+   "this option is only available before your app has been approved." Switching
+   later means a new app record and starting over.
+2. **The bundle identifier is permanent** once the App Store Connect record
+   exists. It is `com.trinamix.expenseapp`.
+
+---
+
+#### Phase 1 — Accounts (weeks, start now)
+
+Both are enrolled per-company and both need a D-U-N-S number for Trinamix.
+They are separate signups and can run in parallel.
+
+| What | Where | Cost | Who |
+|---|---|---|---|
+| Apple Developer Program (Organization) | `developer.apple.com/programs` | US$99/yr | whoever can sign for the company |
+| Apple Business Manager | `business.apple.com` | free | IT / whoever manages Apple devices |
+
+Then get the **Organization ID**: Apple Business Manager → your name at the
+bottom of the sidebar → **Preferences** → **Enrollment Information** → first
+section. It looks like a long number. You cannot proceed without it.
+
+> If Trinamix already manages company iPhones with an MDM, Apple Business
+> Manager almost certainly exists already — ask before starting a new
+> enrolment.
+
+#### Phase 2 — Credentials
+
+```bash
+eas credentials      # iOS -> generate the distribution certificate,
+                     # provisioning profile, and the APNs key for push
+```
+
+Take the EAS-managed defaults. They live in the `trinamix` Expo org, which is
+why that ownership move mattered.
+
+#### Phase 3 — Test on a real iPhone first
+
+Do not submit an app that has never run on the platform. See
+[§10.3](#103-native-builds).
+
+```bash
+eas device:create                              # register the iPhone FIRST
+eas build --profile preview --platform ios     # install from the link
+```
+
+Work through the five iOS-specific paths in
+[§15](#15-known-limitations-and-open-items): date picker, PDF preview,
+keyboard overlap, push permission prompt, notch spacing.
+
+#### Phase 4 — Create the app record and make it Private
+
+In **App Store Connect** → **Apps** → **+** → New App. Bundle ID
+`com.trinamix.expenseapp`, name `Expenses`.
+
+Then, **before submitting anything**:
+
+> **Pricing and Availability** → **App Distribution Methods** →
+> select **Private** → Type: **Organization ID** → paste Trinamix's ID.
+
+This is the step that makes it a Custom App. Everything else is a normal
+submission.
+
+#### Phase 5 — Build and submit
+
+```bash
+# confirm src/config.js points at PRODUCTION before this
+eas build  --profile production --platform ios
+eas submit --profile production --platform ios
+```
+
+Fill the three placeholders in `eas.json` (`appleId`, `ascAppId`,
+`appleTeamId`) from the App Store Connect record first.
+
+Optionally invite colleagues as TestFlight **internal** testers at this point
+— internal testers skip Beta App Review, so it is available in minutes.
+
+#### Phase 6 — Review
+
+Custom Apps are still reviewed. Provide:
+
+- **A working demo account** on production, with a few expenses already on it
+  in different states, plus a second account that can approve — so the
+  reviewer sees the workflow rather than an empty list. Apple's requirement is
+  "an active demo account... plus any other hardware or resources".
+- **Review notes**: internal expense tool for Trinamix employees; accounts are
+  provisioned by HR, so the app has no signup and therefore no in-app account
+  deletion; the backend is live at the URL given.
+- **Privacy policy URL** and the data-collection declarations — work email,
+  employee identity, expense records, receipt images; no advertising, no
+  third-party analytics.
+
+Apple's note for exactly this case: "If your app contains sensitive data,
+provide sample data and authentication for the App Store Review team."
+
+Budget one to three days, plus a cycle for each rejection.
+
+#### Phase 7 — It appears in Apple Business Manager, and you generate codes
+
+Once approved, the app shows up in Trinamix's ABM under **Custom Apps**. It is
+invisible on the public App Store; searching for it finds nothing.
+
+In Apple Business Manager:
+
+1. **Apps and Books** → find `Expenses` under Custom Apps
+2. Choose the quantity of licences needed and acquire them (the app is free,
+   so this costs nothing — it is still a "purchase" of zero-price licences)
+3. Switch the assignment type to **redemption codes** rather than managed
+   distribution, and download the codes. ABM gives you a spreadsheet, one
+   code per licence.
+
+Each code is single-use. Buy more licences than people, so there is slack for
+mistyped codes and new joiners.
+
+> Apple's supported distribution methods for a Custom App are "Mobile Device
+> Management or redemption codes". MDM would push the app silently and handle
+> updates automatically — worth revisiting if Trinamix ever adopts one, but it
+> is not needed here.
+
+#### Phase 8 — The employee installs it
+
+Send the person a code. On their iPhone:
+
+1. Open the **App Store** app
+2. Tap the profile picture, top right
+3. **Redeem Gift Card or Code** → **Enter Code Manually**
+4. Type the code → the app downloads and installs
+
+No Apple Business Manager account, no MDM enrolment, no company-owned device.
+A personal Apple ID is fine. From their side it is an ordinary app that simply
+never came from the store.
+
+Then they log in with their Trinamix email and password — the same credentials
+as every other internal system, since authentication goes to the APEX
+workspace.
+
+> **Write the install instructions into your rollout email**, with the four
+> steps above. "Redeem Gift Card or Code" is not an obvious place to look for
+> a company app, and this is the step where a rollout generates the most
+> support questions.
+
+---
+
+#### Releasing an update afterwards
+
+Same as any other release, and still reviewed:
+
+1. Bump `version` in `app.json`
+2. `eas build --profile production --platform ios`
+3. `eas submit --profile production --platform ios`
+4. Approved → the new version reaches ABM
+
+**Existing users do not need new codes.** Once the app is on a phone, updates
+arrive through the normal App Store update mechanism like any other app — the
+code was only ever for the initial install. New joiners need a fresh code.
+
+Backend-only changes need no release at all.
+
+#### What this route does NOT require
+
+Worth stating plainly, because each is a common assumption:
+
+- **No MDM.** Codes work on unmanaged, personal iPhones.
+- **No company-owned devices.**
+- **No Managed Apple IDs.** A personal Apple ID redeems the code fine.
+- **No public App Store listing.** The app is not findable or downloadable by
+  anyone outside Trinamix.
+- **No cost beyond the $99/yr Developer Program.** Apple Business Manager is
+  free and the app's licences are zero-price.
+
+### 10.9 Android distribution options
+
+Android has a private-publishing route, but it is **not** the mirror image of
+Apple's. The decisive difference:
+
+> Apple's Custom Apps can be distributed by redemption code, with no device
+> management. Google's private apps **can only be distributed through an EMM
+> console** — Google's own words: "You can then use your EMM console to
+> distribute these apps to users."
+
+So if Trinamix has no MDM/EMM, the Apple route works and the equivalent Google
+route does not.
+
+The good news is that Android does not need it. Google Play has **no
+equivalent of Apple's Guideline 4.2** — a login-gated internal business app on
+the public Play Store is unremarkable and not a rejection risk. The reason for
+going private on iOS mostly evaporates here.
+
+#### The four options
+
+| Option | Needs EMM | Needs review | Auto-updates | Cap |
+|---|---|---|---|---|
+| **Direct APK** | no | no | **no** | none |
+| **Play internal testing** | no | minimal | yes | 100 testers |
+| **Play production (public)** | no | yes | yes | none |
+| **Managed Google Play private** | **yes** | yes | yes | 1000 orgs |
+
+**Direct APK.** `eas build --profile preview --platform android`, then email
+the file or host it. Android permits sideloading, so this needs no account, no
+review and no fee. The costs: people must allow "install from unknown
+sources", Play Protect may warn them, and **there are no automatic updates** —
+every release means re-sending the file and asking everyone to reinstall. Fine
+for a pilot, painful as a permanent channel.
+
+**Play internal testing.** Add testers by email in the Play Console; they get
+a link, opt in, and install through the Play Store like any other app —
+including automatic updates. No meaningful review, available in hours. Capped
+at 100 testers. This is the best pilot channel.
+
+**Play production, public listing.** The normal route. Findable by anyone,
+who will hit the login and stop. Automatic updates, no cap, and low rejection
+risk on Play.
+
+**Managed Google Play private app.** The true Apple-Custom-App equivalent:
+Play Console → **Release → Setup → Advanced settings → Managed Google Play**
+→ Add organization → paste Trinamix's Organization ID (found at
+`play.google.com/work` → **Admin Settings**). Invisible publicly, distributed
+via the EMM console. Requires an EMM.
+
+> **One-way door, same as Apple's.** Google: "Once your app is restricted to
+> organizations, your app will be private... If you want your app to be
+> publicly available, you will need to publish a new app with a different
+> package name." Restricting to an organisation cannot be undone — it costs
+> you the package name `com.trinamix.expenseapp`.
+
+#### Recommendation
+
+Without an EMM: **internal testing for the pilot, then a public production
+listing** for the real rollout. Automatic updates are worth more here than
+obscurity, since the API is internet-facing either way and Play carries no
+minimum-functionality risk.
+
+Revisit the managed Google Play route only if Trinamix adopts an EMM — and
+decide before the first production release, because of the one-way door above.
 
 ## 11. Verification
 
@@ -1037,8 +1468,9 @@ and redeploy — the value is compiled into the bundle.
 | Wrong-password test | confirm S2 returns **401 on both environments** after the login fix |
 | Credential rotation | a production password was exposed in plaintext during debugging and should be rotated. Rotating `SESSION_TOKEN_KEY` is optional and logs everyone out |
 | Web build is stale | the currency picker, USD totals and the web alert/date fixes are in source but not in the deployed `gh-pages` bundle. Rebuild per [§10.4](#104-web-build-and-github-pages) |
-| Push notifications never tested end to end | `projectId` now exists, so a development or preview build can finally obtain a token. The backend half has never been exercised against a real device |
-| No rate limiting on `auth/login` | the API is public, so password guessing against a known company email is unthrottled. Worth adding before the store launch — [§10.6](#106-releasing-to-the-app-store-and-play-store) |
+| **Push notifications not enabled** | Devices register fine; the database cannot complete TLS to `exp.host` (`ORA-29024`). Needs a DBA wallet — `db/DBA_REQUEST_push_wallet.md`, then `db/55_push_wallet.sql`. **Not a launch blocker**; email and the in-app list cover the same events — [§10.6](#106-push-notification-credentials) |
+| SMTP host may not be configured | Mail cannot leave the database until an APEX administrator sets `SMTP_HOST_ADDRESS`, and it needs a network ACL like `exp.host` did. `56_email_notifications.sql` section 4 reports whether it is set — [§6.5](#65-email-notifications) |
+| No rate limiting on `auth/login` | the API is public, so password guessing against a known company email is unthrottled. Worth adding before the store launch — [§10.7](#107-releasing-to-the-app-store-and-play-store) |
 | Store accounts not obtained | Apple Developer Program (D-U-N-S number, weeks) and Play Console. Start the Apple one first |
 
 ## 16. Handover checklist
@@ -1058,13 +1490,18 @@ and redeploy — the value is compiled into the bundle.
 - [ ] Functional tests, including the INR direction check
 - [ ] Point `API_BASE_URL` at the new environment, rebuild, redeploy
 
-**Releasing to the App Store and Play Store** ([§10.6](#106-releasing-to-the-app-store-and-play-store))
+**Releasing to the App Store and Play Store** ([§10.7](#107-releasing-to-the-app-store-and-play-store))
 
 - [x] Production API reachable from any network — confirmed, review unblocked
+- [x] iOS route chosen: **private Custom App, redemption codes**
+      ([§10.8](#108-walkthrough-launching-as-a-custom-app-ios--the-chosen-route))
 - [ ] Confirm the ORDS host has a valid public TLS certificate
-- [ ] Consider rate limiting `auth/login` before going public on the stores
-- [ ] Apple Developer Program (organisation, needs a D-U-N-S number) and
-      Google Play Console accounts
+- [ ] Consider rate limiting `auth/login` — the API is public regardless of
+      how the app is distributed
+- [ ] Apple Developer Program (organisation, needs a D-U-N-S number)
+- [ ] Apple Business Manager enrolment, and the **Organization ID**
+- [ ] Decide the Android route ([§10.9](#109-android-distribution-options)) —
+      private on Play needs an EMM, which Apple's route does not
 - [x] Expo project owned by the `trinamix` organisation
 - [x] `eas init` run — `extra.eas.projectId` present in `app.json`
 - [ ] `eas credentials` — and record who holds the Android upload key
