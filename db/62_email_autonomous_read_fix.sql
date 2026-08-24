@@ -1,476 +1,76 @@
-
-
 --------------------------------------------------------------------------------
--- Who is the Finance Manager, and is this EMPID them?
+-- 62_email_autonomous_read_fix.sql
 --
--- Still a single hardcoded id. Replace get_finance_manager_empid's body with a
--- table or role lookup if a second finance manager is ever needed — everything
--- else calls through it, so nothing else changes.
---------------------------------------------------------------------------------
--- >>> THE ONLY PLACE THE FINANCE MANAGER'S EMPID APPEARS <<<
+-- Run as the APPLICATION SCHEMA (REPO). Idempotent. Run the WHOLE file, in
+-- order -- send_expense_mail must be created before the two callers.
 --
--- It used to appear in three: this function, the EXPENSES.FINANCE_MANAGER_EMPID
--- column default, and a literal in the :id/submit handler. Changing only the
--- function let the new person approve while every expense still displayed and
--- routed to the old one -- the function answers "who MAY approve", the other two
--- answered "who is this expense FOR", and they silently disagreed.
-CREATE OR REPLACE FUNCTION get_finance_manager_empid RETURN NUMBER IS
-  c_finance_manager CONSTANT NUMBER := 3725;
-BEGIN
-  RETURN c_finance_manager;
-END get_finance_manager_empid;
-/
-
-CREATE OR REPLACE FUNCTION is_finance_manager(p_emp_id IN NUMBER) RETURN VARCHAR2 IS
-BEGIN
-  RETURN CASE WHEN p_emp_id = get_finance_manager_empid() THEN 'Y' ELSE 'N' END;
-END is_finance_manager;
-/
-
---------------------------------------------------------------------------------
--- Which employee is the Project Manager for a given project? Looks up
--- PROJECT_MANAGER (P_ID -> PROJECT_MANAGER_EMPID). If more than one row
--- exists for the same project, picks the earliest-assigned one
--- (CREATION_DATE ascending) as a deterministic tie-break — change the
--- ORDER BY below if a different rule is wanted.
---------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION get_project_manager_empid(p_project_id IN NUMBER) RETURN NUMBER IS
-  l_pm_empid NUMBER;
-BEGIN
-  IF p_project_id IS NULL THEN
-    RETURN NULL;
-  END IF;
-
-  SELECT project_manager_empid INTO l_pm_empid
-  FROM (
-    SELECT project_manager_empid
-    FROM   project_manager
-    WHERE  p_id = p_project_id
-    ORDER BY creation_date ASC, sr_no ASC
-  )
-  WHERE ROWNUM = 1;
-
-  RETURN l_pm_empid;
-EXCEPTION
-  WHEN NO_DATA_FOUND THEN
-    RETURN NULL;
-END get_project_manager_empid;
-/
-
---------------------------------------------------------------------------------
--- Allowed attachment types: pdf, jpg, jpeg, png, xlsx, xls, csv, rar.
--- Size limit (1MB) is enforced separately, in the upload handler.
---------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION is_allowed_attachment(p_mime IN VARCHAR2) RETURN VARCHAR2 IS
-BEGIN
-  IF p_mime IS NULL THEN
-    RETURN 'Y'; -- attachment is optional at draft stage
-  END IF;
-  RETURN CASE
-    WHEN p_mime IN (
-      'application/pdf',
-      'image/jpeg', 'image/jpg', 'image/png',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', -- xlsx
-      'application/vnd.ms-excel',                                          -- xls
-      'text/csv',
-      'application/x-rar-compressed', 'application/vnd.rar', 'application/x-rar'
-    ) THEN 'Y'
-    ELSE 'N'
-  END;
-END is_allowed_attachment;
-/
-
---------------------------------------------------------------------------------
--- Given an expense + a caller's EMPID, which reviewer role (if any) can
--- they act as on THIS expense right now? NULL if they're not the assigned
--- reviewer at its current stage.
---------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION get_reviewer_role(
-  p_expense_id IN NUMBER,
-  p_emp_id     IN NUMBER
-) RETURN VARCHAR2 IS
-  l_stage         VARCHAR2(20);
-  l_manager_empid NUMBER;
-BEGIN
-  SELECT current_stage, manager_empid
-  INTO   l_stage, l_manager_empid
-  FROM   expenses
-  WHERE  id = p_expense_id;
-
-  IF l_stage = 'MANAGER' AND l_manager_empid = p_emp_id THEN
-    RETURN 'PROJECT_MANAGER';
-  ELSIF l_stage = 'FINANCE' AND is_finance_manager(p_emp_id) = 'Y' THEN
-    RETURN 'FINANCE_MANAGER';
-  ELSE
-    RETURN NULL;
-  END IF;
-EXCEPTION
-  WHEN NO_DATA_FOUND THEN RETURN NULL;
-END get_reviewer_role;
-/
-
---------------------------------------------------------------------------------
--- HMAC-SHA256, built on STANDARD_HASH.
 --
--- DELIBERATELY NOT DBMS_CRYPTO. An app schema often has no execute
--- privilege on SYS.DBMS_CRYPTO and granting it requires a DBA. On the dev
--- schema that grant was absent, so both token functions below compiled
--- INVALID — and an ORDS PL/SQL handler that references an INVALID object is
--- refused before it runs, with ORDS returning a bare "403 Forbidden -
--- Access to the resource is prohibited" and no body. That reads as a
--- permissions problem and is not one; it cost most of a day to trace.
--- STANDARD_HASH is a SQL built-in available to every schema.
+-- THE BUG
+-- -------
+-- Submitting expense #124 produced an email to the EMPLOYEE saying "no project
+-- manager is assigned, this claim cannot be approved" -- while the row plainly
+-- had MANAGER_EMPID 1999, a real employee with a real address.
 --
--- STANDARD_HASH only does plain SHA-256, so HMAC is constructed explicitly
--- per RFC 2104:
+-- Cause: send_expense_mail is PRAGMA AUTONOMOUS_TRANSACTION. It runs in its
+-- own transaction, and an autonomous transaction CANNOT SEE its caller's
+-- uncommitted changes. The submit handler does:
 --
---     HMAC(K, m) = H( (K XOR opad) || H( (K XOR ipad) || m ) )
+--     UPDATE expenses SET manager_empid = ..., submitted_at = ...   -- uncommitted
+--     send_expense_mail(...)                                        -- re-reads the row
 --
--- This is NOT the naive hash(secret || payload), which SHA-256's
--- length-extension property makes forgeable: an attacker holding one valid
--- token could produce a signature for a longer payload without the key.
+-- so the procedure read the row as it was BEFORE the update: an unsubmitted
+-- draft, no manager, no submit date. Every conclusion after that was correct
+-- reasoning applied to stale data -- which is why the email was confidently
+-- wrong, and why the row looked fine when queried afterwards.
 --
--- STANDARD_HASH is a SQL function and cannot be called directly in a PL/SQL
--- expression, hence SELECT ... INTO ... FROM dual.
+-- It also explains the Claim Date showing today rather than the submit time,
+-- and is the same reason p_comment already had to be passed separately: the
+-- EXPENSE_APPROVALS row is invisible for exactly the same reason.
 --
--- Verified against the standard test vector:
---   key='key', msg='The quick brown fox jumps over the lazy dog'
---   => f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
+--
+-- THE FIX
+-- -------
+-- Keep the autonomy -- it is deliberate and worth keeping:
+--   * the mail log must survive a rolled-back approval
+--   * APEX_MAIL.PUSH_QUEUE commits, and must not commit the caller's
+--     half-finished transaction
+--
+-- Instead, the caller passes the three values it has just written and has not
+-- yet committed: manager empid, finance empid, submitted_at. NULL means "not
+-- known, read the row", which stays correct for a manual call after the fact.
+--
+-- The alternative -- dropping the PRAGMA -- would fix the read but let
+-- PUSH_QUEUE commit a half-applied approval. Worse trade.
 --------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION hmac_sha256_hex(
-  p_message IN VARCHAR2,
-  p_key     IN VARCHAR2
-) RETURN VARCHAR2 IS
-  c_block CONSTANT PLS_INTEGER := 64;   -- SHA-256 block size in bytes
-  l_key   RAW(256);
-  l_klen  PLS_INTEGER;
-  l_ipad  RAW(64);
-  l_opad  RAW(64);
-  l_inner RAW(32);
-  l_outer RAW(32);
-BEGIN
-  l_key  := UTL_I18N.STRING_TO_RAW(p_key, 'AL32UTF8');
-  l_klen := UTL_RAW.LENGTH(l_key);
 
-  IF l_klen > c_block THEN
-    SELECT STANDARD_HASH(l_key, 'SHA256') INTO l_key FROM dual;
-    l_klen := UTL_RAW.LENGTH(l_key);
-  END IF;
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET DEFINE OFF
 
-  IF l_klen < c_block THEN
-    l_key := UTL_RAW.CONCAT(l_key, UTL_RAW.COPIES(HEXTORAW('00'), c_block - l_klen));
-  END IF;
 
-  l_ipad := UTL_RAW.BIT_XOR(l_key, UTL_RAW.COPIES(HEXTORAW('36'), c_block));
-  l_opad := UTL_RAW.BIT_XOR(l_key, UTL_RAW.COPIES(HEXTORAW('5C'), c_block));
-
-  SELECT STANDARD_HASH(
-           UTL_RAW.CONCAT(l_ipad, UTL_I18N.STRING_TO_RAW(p_message, 'AL32UTF8')),
-           'SHA256')
-    INTO l_inner FROM dual;
-
-  SELECT STANDARD_HASH(UTL_RAW.CONCAT(l_opad, l_inner), 'SHA256')
-    INTO l_outer FROM dual;
-
-  RETURN RAWTOHEX(l_outer);
-END hmac_sha256_hex;
-/
-
--- Fail the deployment rather than install a broken signer.
+--------------------------------------------------------------------------------
+-- STEP 0   --   Right schema?
+--------------------------------------------------------------------------------
 DECLARE
-  c_expected CONSTANT VARCHAR2(64) :=
-    'F7BC83F430538424B13298E6AA6FB143EF4D59A14946175997479DBC2D1A3CD8';
-  l_actual VARCHAR2(64);
+  l_schema VARCHAR2(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');
+  l_n      NUMBER;
 BEGIN
-  l_actual := hmac_sha256_hex('The quick brown fox jumps over the lazy dog', 'key');
-  IF UPPER(l_actual) != c_expected THEN
-    RAISE_APPLICATION_ERROR(-20099,
-      'HMAC-SHA256 self-test FAILED. Expected ' || c_expected ||
-      ' but got ' || UPPER(l_actual) || '. Do not use these tokens.');
+  DBMS_OUTPUT.PUT_LINE('Connected as: ' || l_schema);
+  SELECT COUNT(*) INTO l_n FROM user_objects
+  WHERE  object_name = 'SEND_EXPENSE_MAIL' AND status = 'VALID';
+  IF l_n = 0 THEN
+    RAISE_APPLICATION_ERROR(-20001,
+      'SEND_EXPENSE_MAIL not found on ' || l_schema
+      || '. Run EMAIL_DEPLOY.sql on the app schema first. Nothing changed.');
   END IF;
+  DBMS_OUTPUT.PUT_LINE('OK, proceeding.');
 END;
 /
 
 
 --------------------------------------------------------------------------------
--- Signed session tokens (see PROD_1_schema.sql's APP_SECRETS table).
--- Token shape: "<emp_id>.<expiry_epoch_seconds>.<hmac_signature>".
+-- STEP 1   --   send_expense_mail, accepting the caller's uncommitted values
 --------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION generate_session_token(p_emp_id IN NUMBER) RETURN VARCHAR2 IS
-  l_secret  VARCHAR2(200);
-  l_expiry  NUMBER;
-  l_payload VARCHAR2(100);
-BEGIN
-  SELECT secret_value INTO l_secret FROM app_secrets WHERE secret_name = 'SESSION_TOKEN_KEY';
 
-  l_expiry  := ROUND((SYSDATE - DATE '1970-01-01') * 86400) + (12 * 3600); -- now + 12h
-  l_payload := p_emp_id || '.' || l_expiry;
-
-  RETURN l_payload || '.' || hmac_sha256_hex(l_payload, l_secret);
-END generate_session_token;
-/
-
-CREATE OR REPLACE FUNCTION is_valid_session_token(
-  p_emp_id IN NUMBER,
-  p_token  IN VARCHAR2
-) RETURN VARCHAR2 IS
-  l_secret       VARCHAR2(200);
-  l_tok_emp      VARCHAR2(50);
-  l_tok_exp      VARCHAR2(50);
-  l_tok_sig      VARCHAR2(200);
-  l_expected_sig VARCHAR2(200);
-  l_now          NUMBER;
-  l_dot1         NUMBER;
-  l_dot2         NUMBER;
-BEGIN
-  IF p_token IS NULL OR p_emp_id IS NULL THEN
-    RETURN 'N';
-  END IF;
-
-  l_dot1 := INSTR(p_token, '.');
-  l_dot2 := INSTR(p_token, '.', 1, 2);
-  IF l_dot1 = 0 OR l_dot2 = 0 THEN
-    RETURN 'N';
-  END IF;
-
-  l_tok_emp := SUBSTR(p_token, 1, l_dot1 - 1);
-  l_tok_exp := SUBSTR(p_token, l_dot1 + 1, l_dot2 - l_dot1 - 1);
-  l_tok_sig := SUBSTR(p_token, l_dot2 + 1);
-
-  IF TO_NUMBER(l_tok_emp) != p_emp_id THEN
-    RETURN 'N';
-  END IF;
-
-  l_now := ROUND((SYSDATE - DATE '1970-01-01') * 86400);
-  IF TO_NUMBER(l_tok_exp) < l_now THEN
-    RETURN 'N';
-  END IF;
-
-  SELECT secret_value INTO l_secret FROM app_secrets WHERE secret_name = 'SESSION_TOKEN_KEY';
-  l_expected_sig := hmac_sha256_hex(l_tok_emp || '.' || l_tok_exp, l_secret);
-
-  IF UPPER(l_expected_sig) = UPPER(l_tok_sig) THEN
-    RETURN 'Y';
-  ELSE
-    RETURN 'N';
-  END IF;
-EXCEPTION
-  WHEN OTHERS THEN
-    RETURN 'N';
-END is_valid_session_token;
-/
-
---------------------------------------------------------------------------------
--- Fetches an app-level OAuth Bearer token on the app's behalf, using the
--- client id/secret/token-URL stored server-side in APP_SECRETS (seeded in
--- PROD_2_ords_and_security_setup.sql, section 5.1) — never sent to any
--- client. Called only from inside POST /expenses/auth/login
--- (PROD_4_endpoints.sql), right after a real employee username/password
--- has been verified. This is what lets the app stop shipping
--- OAUTH_CLIENT_ID/OAUTH_CLIENT_SECRET entirely: instead of the app
--- fetching its own token with an embedded secret, the server fetches it
--- for the app and hands it back alongside the session token, in one
--- login response.
---------------------------------------------------------------------------------
-CREATE OR REPLACE PROCEDURE get_oauth_access_token(
-  p_access_token OUT VARCHAR2,
-  p_expires_in   OUT NUMBER
-) IS
-  l_client_id     VARCHAR2(200);
-  l_client_secret VARCHAR2(200);
-  l_token_url     VARCHAR2(500);
-  l_response      CLOB;
-BEGIN
-  SELECT secret_value INTO l_client_id     FROM app_secrets WHERE secret_name = 'OAUTH_CLIENT_ID';
-  SELECT secret_value INTO l_client_secret FROM app_secrets WHERE secret_name = 'OAUTH_CLIENT_SECRET';
-  SELECT secret_value INTO l_token_url     FROM app_secrets WHERE secret_name = 'OAUTH_TOKEN_URL';
-
-  apex_web_service.g_request_headers.DELETE;
-  apex_web_service.g_request_headers(1).name  := 'Content-Type';
-  apex_web_service.g_request_headers(1).value := 'application/x-www-form-urlencoded';
-
-  BEGIN
-    l_response := apex_web_service.make_rest_request(
-      p_url         => l_token_url,
-      p_http_method => 'POST',
-      p_username    => l_client_id,
-      p_password    => l_client_secret,
-      p_body        => 'grant_type=client_credentials'
-    );
-  EXCEPTION
-    -- ORA-29273 ("HTTP request failed") is just a wrapper — the real
-    -- cause (missing ACL grant, SSL/certificate problem, DNS failure,
-    -- connection refused, etc.) is in UTL_HTTP's detailed error, which
-    -- SQLERRM alone does NOT include. Surface that instead of the vague
-    -- wrapper message.
-    WHEN OTHERS THEN
-      RAISE_APPLICATION_ERROR(-20052,
-        'OAuth token request to ' || l_token_url || ' failed. ' ||
-        UTL_HTTP.GET_DETAILED_SQLERRM || ' (top-level: ' || SQLERRM || ')');
-  END;
-
-  p_access_token := JSON_VALUE(l_response, '$.access_token');
-  p_expires_in   := NVL(JSON_VALUE(l_response, '$.expires_in' RETURNING NUMBER), 3600);
-
-  IF p_access_token IS NULL THEN
-    RAISE_APPLICATION_ERROR(-20050,
-      'OAuth token request did not return an access_token. Check OAUTH_CLIENT_ID/OAUTH_CLIENT_SECRET/OAUTH_TOKEN_URL in APP_SECRETS, and confirm the Network ACL grant for your own domain (PROD_2, section 6) is in place. Raw response: ' ||
-      DBMS_LOB.SUBSTR(l_response, 500, 1));
-  END IF;
-EXCEPTION
-  WHEN NO_DATA_FOUND THEN
-    RAISE_APPLICATION_ERROR(-20051,
-      'OAuth client credentials are not configured yet — see PROD_2_ords_and_security_setup.sql, section 5.1.');
-END get_oauth_access_token;
-/
-
---------------------------------------------------------------------------------
--- Push notifications: escaping helper + the sender itself.
---------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION json_escape_str(p_str IN VARCHAR2) RETURN VARCHAR2 IS
-BEGIN
-  IF p_str IS NULL THEN RETURN ''; END IF;
-  RETURN REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p_str,
-    '\', '\\'), '"', '\"'), CHR(10), '\n'), CHR(13), ''), CHR(9), '\t');
-END json_escape_str;
-/
-
-CREATE OR REPLACE PROCEDURE send_push_notification(
-  p_emp_id      IN NUMBER,
-  p_title       IN VARCHAR2,
-  p_body        IN VARCHAR2,
-  p_expense_id  IN NUMBER DEFAULT NULL
-) IS
-  PRAGMA AUTONOMOUS_TRANSACTION;
-  l_payload  CLOB;
-  l_response CLOB;
-BEGIN
-  FOR t IN (SELECT push_token FROM emp_push_tokens WHERE emp_id = p_emp_id) LOOP
-    BEGIN
-      -- sound/priority/channelId are what make this appear as a BANNER on
-      -- the phone rather than a silent line in the notification drawer.
-      --   priority  'high'             -> FCM delivers immediately instead of
-      --                                   batching it until the device next
-      --                                   wakes, which on a dozing phone can
-      --                                   be many minutes.
-      --   channelId 'expense-updates'  -> must match the channel created in
-      --                                   src/pushNotifications.js. Android 8+
-      --                                   takes the importance (and therefore
-      --                                   whether a banner appears at all)
-      --                                   from the CHANNEL, not the message.
-      --                                   A channelId with no matching channel
-      --                                   on the device falls back to the
-      --                                   default one, silently.
-      l_payload := '{"to":"' || json_escape_str(t.push_token) ||
-                   '","title":"' || json_escape_str(p_title) ||
-                   '","body":"' || json_escape_str(p_body) ||
-                   '","sound":"default"' ||
-                   ',"priority":"high"' ||
-                   ',"channelId":"expense-updates"' ||
-                   CASE WHEN p_expense_id IS NOT NULL
-                        THEN ',"data":{"expenseId":' || p_expense_id || '}'
-                        ELSE '' END ||
-                   '}';
-
-      apex_web_service.g_request_headers.DELETE;
-      apex_web_service.g_request_headers(1).name  := 'Content-Type';
-      apex_web_service.g_request_headers(1).value := 'application/json';
-      apex_web_service.g_request_headers(2).name  := 'Accept';
-      apex_web_service.g_request_headers(2).value := 'application/json';
-
-      l_response := apex_web_service.make_rest_request(
-        p_url         => 'https://exp.host/--/api/v2/push/send',
-        p_http_method => 'POST',
-        p_body        => l_payload
-      );
-    EXCEPTION
-      WHEN OTHERS THEN NULL;
-    END;
-  END LOOP;
-  COMMIT;
-EXCEPTION
-  WHEN OTHERS THEN
-    ROLLBACK;
-END send_push_notification;
-/
-
---------------------------------------------------------------------------------
--- Core approval-action logic, shared by the single-item and bulk
--- accept/revise/reject endpoints (PROD_4_endpoints.sql).
---------------------------------------------------------------------------------
---------------------------------------------------------------------------------
--- Mail configuration: sender address and APEX workspace.
---
--- The workspace is resolved HERE, at deploy time, rather than hardcoded -- it
--- differs per environment and a wrong value fails in a way that looks like a
--- mail server problem. APEX_MAIL.SEND needs it because it requires a security
--- group id, and an ORDS handler has no APEX session.
---
--- EDIT MAIL_FROM if IT specifies a different sender. It must be an address the
--- mail server will accept, or everything is rejected or filed as spam.
---------------------------------------------------------------------------------
-DECLARE
-  l_ws VARCHAR2(200);
-  l_n  NUMBER;
-BEGIN
-  SELECT COUNT(DISTINCT workspace_name) INTO l_n
-  FROM   apex_workspace_apex_users
-  WHERE  workspace_name != 'INTERNAL';
-
-  IF l_n = 1 THEN
-    SELECT DISTINCT workspace_name INTO l_ws
-    FROM   apex_workspace_apex_users
-    WHERE  workspace_name != 'INTERNAL';
-
-    MERGE INTO app_secrets t
-    USING (SELECT 'MAIL_WORKSPACE' AS n, l_ws AS v FROM dual) s
-    ON (t.secret_name = s.n)
-    WHEN MATCHED THEN UPDATE SET t.secret_value = s.v
-    WHEN NOT MATCHED THEN INSERT (secret_name, secret_value) VALUES (s.n, s.v);
-
-    DBMS_OUTPUT.PUT_LINE('MAIL_WORKSPACE resolved to: ' || l_ws);
-  ELSE
-    DBMS_OUTPUT.PUT_LINE('Found ' || l_n || ' candidate workspaces -- cannot choose.');
-    DBMS_OUTPUT.PUT_LINE('Set it by hand:');
-    DBMS_OUTPUT.PUT_LINE('  UPDATE app_secrets SET secret_value = ''<WORKSPACE>''');
-    DBMS_OUTPUT.PUT_LINE('  WHERE secret_name = ''MAIL_WORKSPACE'';');
-  END IF;
-END;
-/
-
--- Sender address. EDIT THIS if IT specifies something different. It must be an
--- address the mail server will accept as a sender, or everything is rejected
--- or filed as spam -- which is why the old behaviour of sending AS the acting
--- employee was a liability rather than a convenience.
-MERGE INTO app_secrets t
-USING (SELECT 'MAIL_FROM' AS n, 'noreply@trinamix.com' AS v FROM dual) s
-ON (t.secret_name = s.n)
-WHEN MATCHED THEN UPDATE SET t.secret_value = s.v
-WHEN NOT MATCHED THEN INSERT (secret_name, secret_value) VALUES (s.n, s.v);
-
-COMMIT;
-
-
---------------------------------------------------------------------------------
--- All expense notification email, in one place.
---
--- Callers say WHAT happened and WHO did it; this decides who hears about it.
--- The matrix used to be scattered across six inline APEX_MAIL.SEND calls and
--- had drifted badly -- on revision and rejection it mailed the managers and
--- not the employee, the one person who had to act.
---
---   EVENT             TO                CC
---   SUBMITTED         project manager   employee
---   MANAGER_ACCEPTED  finance manager   project manager + employee
---   FINANCE_ACCEPTED  employee          project manager
---   REVISED           employee          project manager, if Finance asked
---   REJECTED          employee          project manager, if Finance rejected
---
--- Requires APP_SECRETS rows MAIL_FROM and MAIL_WORKSPACE -- see
--- 56_email_notifications.sql section 2, which seeds them. Without
--- MAIL_WORKSPACE, APEX_MAIL.SEND raises immediately: it needs a security
--- group id and there is no APEX session in an ORDS handler.
---------------------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE send_expense_mail(
   p_expense_id  IN NUMBER,
   p_event       IN VARCHAR2,
@@ -931,6 +531,10 @@ END send_expense_mail;
 /
 
 
+--------------------------------------------------------------------------------
+-- STEP 2   --   process_expense_action, passing what it read under FOR UPDATE
+--------------------------------------------------------------------------------
+
 CREATE OR REPLACE PROCEDURE process_expense_action(
   p_expense_id  IN  NUMBER,
   p_emp_id      IN  NUMBER,
@@ -1039,4 +643,154 @@ EXCEPTION
 END process_expense_action;
 /
 
-COMMIT;
+
+--------------------------------------------------------------------------------
+-- STEP 3   --   POST /expenses/{id}/submit, passing what it just stamped
+--------------------------------------------------------------------------------
+
+BEGIN
+  ORDS.DEFINE_HANDLER(
+    p_module_name => 'expenses.employee',
+    p_pattern     => ':id/submit',
+    p_method      => 'POST',
+    p_source_type => ords.source_type_plsql,
+    p_source      => q'[
+      DECLARE
+        l_emp_id        NUMBER := TO_NUMBER(:emp_id_hdr);
+        l_owner_id      NUMBER;
+        l_status        VARCHAR2(30);
+        l_current_stage VARCHAR2(20);
+        l_project_id    NUMBER;
+        l_manager_id    NUMBER;
+        l_finance_id    NUMBER;
+        l_emp_email     VARCHAR2(255);
+        l_mgr_email     VARCHAR2(255);
+      BEGIN
+        IF is_valid_session_token(l_emp_id, :session_token_hdr) != 'Y' THEN
+          :status := 401;
+          APEX_JSON.OPEN_OBJECT; APEX_JSON.WRITE('error', 'Session expired or invalid. Please log in again.'); APEX_JSON.CLOSE_OBJECT;
+          RETURN;
+        END IF;
+
+        SELECT emp_id, status, current_stage, project_id, manager_empid, finance_manager_empid
+        INTO   l_owner_id, l_status, l_current_stage, l_project_id, l_manager_id, l_finance_id
+        FROM   expenses WHERE id = :id FOR UPDATE;
+
+        IF l_owner_id != l_emp_id THEN
+          :status := 403;
+          APEX_JSON.OPEN_OBJECT; APEX_JSON.WRITE('error', 'Not your expense'); APEX_JSON.CLOSE_OBJECT;
+          RETURN;
+        END IF;
+
+        IF l_status = 'DRAFT' THEN
+          l_manager_id := get_project_manager_empid(l_project_id);
+          l_finance_id := get_finance_manager_empid();
+
+          UPDATE expenses
+          SET status = 'SUBMITTED',
+              current_stage = 'MANAGER',
+              manager_empid = l_manager_id,
+              finance_manager_empid = l_finance_id,
+              submitted_by = l_emp_id,
+              submitted_at = SYSTIMESTAMP
+          WHERE id = :id;
+
+          -- TO the project manager, CC the employee.
+          --
+          -- manager_empid and submitted_at are passed explicitly because the
+          -- UPDATE above is NOT yet committed, and send_expense_mail is
+          -- autonomous -- it would otherwise re-read the row, still see an
+          -- unsubmitted draft with no manager, and email the employee saying
+          -- no project manager was assigned.
+          send_expense_mail(:id, 'SUBMITTED', l_emp_id, NULL, NULL,
+                            l_manager_id, l_finance_id, SYSTIMESTAMP);
+
+          send_push_notification(l_emp_id, 'Expense Submitted',
+            'Your expense #' || :id || ' was submitted for approval.', :id);
+          IF l_manager_id IS NOT NULL THEN
+            send_push_notification(l_manager_id, 'Approval Needed',
+              'An expense from your project is waiting for your approval.', :id);
+          END IF;
+
+        ELSIF l_status = 'REVISION_REQUESTED' THEN
+          UPDATE expenses SET status = 'SUBMITTED' WHERE id = :id;
+
+          send_push_notification(l_emp_id, 'Expense Resubmitted',
+            'Your expense #' || :id || ' was resubmitted for approval.', :id);
+
+          IF l_current_stage = 'MANAGER' AND l_manager_id IS NOT NULL THEN
+            send_push_notification(l_manager_id, 'Approval Needed',
+              'A revised expense is waiting for your approval.', :id);
+          ELSIF l_current_stage = 'FINANCE' AND l_finance_id IS NOT NULL THEN
+            send_push_notification(l_finance_id, 'Approval Needed',
+              'A revised expense is waiting for your approval.', :id);
+          END IF;
+
+        ELSE
+          :status := 409;
+          APEX_JSON.OPEN_OBJECT;
+          APEX_JSON.WRITE('error', 'Cannot submit an expense in status ' || l_status);
+          APEX_JSON.CLOSE_OBJECT;
+          RETURN;
+        END IF;
+
+        :status := 200;
+        APEX_JSON.OPEN_OBJECT; APEX_JSON.WRITE('id', :id); APEX_JSON.WRITE('status', 'SUBMITTED'); APEX_JSON.CLOSE_OBJECT;
+      EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+          :status := 404;
+          APEX_JSON.OPEN_OBJECT; APEX_JSON.WRITE('error', 'Expense not found'); APEX_JSON.CLOSE_OBJECT;
+      END;
+    ]'
+  );
+  ORDS.DEFINE_PARAMETER(
+    p_module_name => 'expenses.employee', p_pattern => ':id/submit', p_method => 'POST',
+    p_name => 'X-Emp-Id', p_bind_variable_name => 'emp_id_hdr',
+    p_source_type => 'HEADER', p_param_type => 'STRING', p_access_method => 'IN'
+  );
+  ORDS.DEFINE_PARAMETER(
+    p_module_name => 'expenses.employee', p_pattern => ':id/submit', p_method => 'POST',
+    p_name => 'X-Session-Token', p_bind_variable_name => 'session_token_hdr',
+    p_source_type => 'HEADER', p_param_type => 'STRING', p_access_method => 'IN'
+  );
+  ORDS.DEFINE_PARAMETER(
+    p_module_name => 'expenses.employee', p_pattern => ':id/submit', p_method => 'POST',
+    p_name => 'X-APEX-STATUS-CODE', p_bind_variable_name => 'status',
+    p_source_type => 'HEADER', p_access_method => 'OUT'
+  );
+  COMMIT;
+END;
+/
+
+
+--------------------------------------------------------------------------------
+-- STEP 4   --   Verify
+--------------------------------------------------------------------------------
+SELECT object_name, status FROM user_objects
+WHERE  object_name IN ('SEND_EXPENSE_MAIL','PROCESS_EXPENSE_ACTION')
+ORDER  BY object_name;
+
+-- The live handler must pass the ids through.
+SELECT CASE WHEN INSTR(h.source,'l_manager_id, l_finance_id, SYSTIMESTAMP') > 0
+            THEN 'Y' ELSE 'N' END AS passes_ids
+FROM   user_ords_handlers h
+JOIN   user_ords_templates t ON t.id = h.template_id
+JOIN   user_ords_modules m   ON m.id = t.module_id
+WHERE  m.name = 'expenses.employee'
+AND    t.uri_template = ':id/submit' AND h.method = 'POST';
+
+
+--------------------------------------------------------------------------------
+-- STEP 5   --   Test properly: submit a NEW claim from the app.
+--
+-- Re-sending mail for #124 by hand will now look right, but it proves nothing
+-- -- that row is committed, so even the old code would read it correctly. The
+-- bug only appears mid-transaction. Submit a fresh claim, then:
+--
+--   SELECT created_at, event, status, mail_to, mail_cc
+--   FROM   expense_mail_log ORDER BY id DESC FETCH FIRST 3 ROWS ONLY;
+--
+-- Expect MAIL_TO = the project manager (Jayesh.gulve@trinamix.com for project
+-- 2386), MAIL_CC = the submitter, no "no project manager" warning, and a Claim
+-- Date matching the real submit time.
+--------------------------------------------------------------------------------

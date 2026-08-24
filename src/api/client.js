@@ -398,6 +398,132 @@ export async function getAttachmentDownloadHeaders(empId) {
   return authHeaders(empId);
 }
 
+// ---- Bills within a claim ----
+//
+// An expense is a CLAIM: who, which project, what it was for, and its status
+// in the approval workflow. The BILLS live underneath it, one row each, with
+// their own dates, currency, amount and receipt — see MULTI_BILL_PLAN.md and
+// db/64..66.
+//
+// The claim's amount_usd is the SUM of its bills, maintained server-side by
+// recalc_claim_totals. The app never computes it: two places deciding what a
+// claim is worth is how they end up disagreeing.
+//
+// Conversion rate and USD amount are likewise NEVER sent from here. The server
+// derives them from the currency, the amount and the bill's own from_date. A
+// client-supplied rate would be a client-supplied reimbursement figure. Fields
+// like `exchange_rate` in a response are read-only.
+
+export async function listItems(empId, expenseId) {
+  const res = await fetchWithTimeout(`${API_BASE_URL}/expenses/${expenseId}/items`, {
+    headers: await authHeaders(empId),
+  });
+  return handle(res);
+}
+
+// `bill` takes ISO dates (YYYY-MM-DD) — the item endpoints expect ISO, unlike
+// the older claim endpoints which use MM/DD/YYYY. Deliberate: ISO sorts and
+// parses unambiguously, and the mismatch is contained to this one function
+// rather than leaking into the screens. Use isoFromMDY below if you have the
+// app's display format.
+//
+// Everything except bill_no is required:
+//   { bill_no?, bill_date, type, description,
+//     from_date, to_date, currency, amount }
+export async function addItem(empId, expenseId, bill) {
+  const res = await fetchWithTimeout(`${API_BASE_URL}/expenses/${expenseId}/items`, {
+    method: 'POST',
+    headers: await authHeaders(empId, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify(bill),
+  });
+  return handle(res);
+}
+
+// Send only what changed — an omitted field is left as-is server-side. The
+// rate and USD amount are recomputed from the stored row afterwards, so
+// changing the currency, the amount or from_date all reprice correctly.
+export async function updateItem(empId, expenseId, itemId, changes) {
+  const res = await fetchWithTimeout(
+    `${API_BASE_URL}/expenses/${expenseId}/items/${itemId}`,
+    {
+      method: 'PUT',
+      headers: await authHeaders(empId, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(changes),
+    }
+  );
+  return handle(res);
+}
+
+export async function deleteItem(empId, expenseId, itemId) {
+  const res = await fetchWithTimeout(
+    `${API_BASE_URL}/expenses/${expenseId}/items/${itemId}`,
+    { method: 'DELETE', headers: await authHeaders(empId) }
+  );
+  if (res.status === 204) return {};
+  return handle(res);
+}
+
+// Same two-step as a brand-new claim has always used: save the row, then
+// upload against the id it returns. That is what makes "attach the receipt
+// before saving" work from the user's point of view — the file is held in
+// screen state and posted the moment the bill exists.
+export async function uploadItemAttachment(empId, expenseId, itemId, file) {
+  const formData = new FormData();
+
+  if (Platform.OS === 'web') {
+    // See uploadAttachment above: browser FormData needs a real Blob, and
+    // silently serialises a {uri,name,type} object to "[object Object]".
+    const blob = file.file || (await (await fetch(file.uri)).blob());
+    formData.append('file', blob, file.name);
+  } else {
+    formData.append('file', {
+      uri: file.uri,
+      name: file.name,
+      type: file.mimeType || 'application/octet-stream',
+    });
+  }
+
+  const res = await fetchWithTimeout(
+    `${API_BASE_URL}/expenses/${expenseId}/items/${itemId}/attachment`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${currentAccessToken || ''}`,
+        'X-Emp-Id': String(empId),
+        'X-Session-Token': currentSessionToken || '',
+        'X-File-Name': file.name,
+        // Content-Type is set by fetch/FormData with the right multipart
+        // boundary. Setting it by hand breaks the upload.
+      },
+      body: formData,
+    }
+  );
+  return handle(res);
+}
+
+export function getItemAttachmentUrl(expenseId, itemId) {
+  return `${API_BASE_URL}/expenses/${expenseId}/items/${itemId}/attachment`;
+}
+
+// The app shows and stores dates as MM/DD/YYYY (see src/components/DateField.js)
+// while the item endpoints take ISO. One conversion, in one place, rather than
+// scattered .split('/') calls in the screens.
+export function isoFromMDY(mdy) {
+  if (!mdy) return null;
+  const parts = String(mdy).split('/');
+  if (parts.length !== 3) return null;
+  const [mm, dd, yyyy] = parts;
+  return `${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;
+}
+
+export function mdyFromISO(iso) {
+  if (!iso) return '';
+  const parts = String(iso).slice(0, 10).split('-');
+  if (parts.length !== 3) return '';
+  const [yyyy, mm, dd] = parts;
+  return `${mm}/${dd}/${yyyy}`;
+}
+
 // Registers (or updates) this device's Expo push token for empId, so the
 // backend knows where to deliver real phone notifications — see
 // src/pushNotifications.js for where this gets called from.

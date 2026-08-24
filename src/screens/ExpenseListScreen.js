@@ -104,8 +104,15 @@ export default function ExpenseListScreen({ navigation }) {
         </View>
         <View style={{ flex: 1 }}>
           <Text style={styles.rowTitle}>
-            {item.type || 'Expense'} &mdash;{' '}
-            {item.currency ? `${item.amount} ${item.currency}` : `₹${item.amount}`}
+            {/* claim_for, not type: TYPE is per-bill now and no longer written
+                on the claim, so it would read "Expense" on every row. And the
+                total is amount_usd -- `amount` is a sum across currencies,
+                which is a number in no currency at all. */}
+            {item.claim_for || item.type || 'Expense'} &mdash;{' '}
+            {item.amount_usd != null ? `$${item.amount_usd}` : '—'}
+            {Number(item.item_count) > 0
+              ? ` · ${item.item_count} ${Number(item.item_count) === 1 ? 'bill' : 'bills'}`
+              : ' · no bills'}
             {item.amount_usd != null && item.currency !== 'USD' ? ` ($${item.amount_usd})` : ''}
           </Text>
           <Text style={styles.rowSubtitle}>

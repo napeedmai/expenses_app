@@ -722,8 +722,15 @@ BEGIN
               submitted_at = SYSTIMESTAMP
           WHERE id = :id;
 
-          -- TO the project manager, CC the employee. See send_expense_mail.
-          send_expense_mail(:id, 'SUBMITTED', l_emp_id);
+          -- TO the project manager, CC the employee.
+          --
+          -- manager_empid and submitted_at are passed explicitly because the
+          -- UPDATE above is NOT yet committed, and send_expense_mail is
+          -- autonomous -- it would otherwise re-read the row, still see an
+          -- unsubmitted draft with no manager, and email the employee saying
+          -- no project manager was assigned.
+          send_expense_mail(:id, 'SUBMITTED', l_emp_id, NULL, NULL,
+                            l_manager_id, l_finance_id, SYSTIMESTAMP);
 
           send_push_notification(l_emp_id, 'Expense Submitted',
             'Your expense #' || :id || ' was submitted for approval.', :id);

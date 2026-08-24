@@ -10,7 +10,7 @@
 // with a permanently-blank attachment section). Falls back gracefully if
 // that SQL hasn't been run yet.
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -33,8 +33,9 @@ import {
   acceptExpense,
   reviseExpense,
   rejectExpense,
-  getAttachmentUrl,
   getAttachmentDownloadHeaders,
+  listItems,
+  getItemAttachmentUrl,
 } from '../api/client';
 import { radius, shadow, fileBadgeForName, stageLabelShort } from '../theme';
 import { showAlert } from '../utils/alert';
@@ -49,8 +50,30 @@ export default function ReviewExpenseScreen({ route, navigation }) {
   const [comment, setComment] = useState('');
   const [submitting, setSubmitting] = useState(null); // 'accept' | 'revise' | 'reject' | null
   const [error, setError] = useState(null);
-  const [previewing, setPreviewing] = useState(false);
+  const [previewing, setPreviewing] = useState(null);   // the bill id being opened
   const [previewImageUri, setPreviewImageUri] = useState(null);
+  const [bills, setBills] = useState([]);
+  const [billsLoading, setBillsLoading] = useState(true);
+
+  // A claim can hold up to 20 bills. The pending list only carries the claim
+  // header, so fetch them here -- a reviewer approving a large claim has to see
+  // every line, not just the first.
+  useEffect(() => {
+    let cancelled = false;
+    listItems(empId, expense.id)
+      .then((d) => {
+        if (!cancelled) setBills(Array.isArray(d.items) ? d.items : []);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e.message || 'Could not load the bills on this claim.');
+      })
+      .finally(() => {
+        if (!cancelled) setBillsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [empId, expense.id]);
 
   async function handleAction(action) {
     if ((action === 'revise' || action === 'reject') && !comment.trim()) {
@@ -76,22 +99,21 @@ export default function ReviewExpenseScreen({ route, navigation }) {
   // reviewer needs to see the receipt before deciding, and this was previously
   // a near-copy of that screen's version, which meant the PDF-opening bug had
   // to be found and fixed twice.
-  async function handlePreviewAttachment() {
-    setPreviewing(true);
+  async function handlePreviewBill(bill) {
+    setPreviewing(bill.id);
     setError(null);
     try {
       const headers = await getAttachmentDownloadHeaders(empId);
-
       await openAttachment({
-        url: getAttachmentUrl(expense.id),
+        url: getItemAttachmentUrl(expense.id, bill.id),
         headers,
-        filename: expense.attachment_filename,
+        filename: bill.attachment_filename,
         onImage: setPreviewImageUri,
       });
     } catch (e) {
-      setError(e.message || 'Failed to preview attachment.');
+      setError(e.message || 'Failed to open that receipt.');
     } finally {
-      setPreviewing(false);
+      setPreviewing(null);
     }
   }
 
@@ -103,7 +125,6 @@ export default function ReviewExpenseScreen({ route, navigation }) {
   const st = colors.status[displayStatus] || colors.status.SUBMITTED;
   const submitterName = expense.emp_name || `Employee #${expense.emp_id}`;
   const initial = submitterName.trim().charAt(0).toUpperCase() || '#';
-  const badge = expense.attachment_filename ? fileBadgeForName(expense.attachment_filename) : null;
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={{ padding: 16 }}>
@@ -122,34 +143,9 @@ export default function ReviewExpenseScreen({ route, navigation }) {
         </View>
       </View>
 
+      {/* The CLAIM. Its total is the sum of the bills, computed server-side --
+          the reviewer is approving one figure, itemised below. */}
       <View style={styles.card}>
-        <Row styles={styles} label="Type" value={expense.type || '—'} />
-        {/* Show the amount as submitted, in its own currency, with the USD
-            equivalent beneath. A reviewer needs the original to match the
-            receipt in front of them, and the USD figure to compare against
-            other claims. Hardcoding ₹ here would have labelled a dollar or
-            euro expense as rupees. */}
-        <Row
-          styles={styles}
-          label="Amount"
-          value={
-            expense.currency
-              ? `${expense.amount} ${expense.currency}`
-              : `₹${expense.amount}`
-          }
-        />
-        {expense.amount_usd != null && expense.currency !== 'USD' ? (
-          <Row
-            styles={styles}
-            label="Amount (USD)"
-            value={`$${expense.amount_usd}${
-              expense.exchange_rate ? `  ·  1 ${expense.currency} = $${expense.exchange_rate}` : ''
-            }`}
-          />
-        ) : null}
-        <Row styles={styles} label="Period" value={`${expense.from_date} to ${expense.to_date}`} />
-        {expense.bill_no ? <Row styles={styles} label="Bill No." value={expense.bill_no} /> : null}
-        {expense.bill_date ? <Row styles={styles} label="Bill Date" value={expense.bill_date} /> : null}
         {expense.project_name || expense.project_id ? (
           <Row
             styles={styles}
@@ -157,25 +153,77 @@ export default function ReviewExpenseScreen({ route, navigation }) {
             value={expense.project_name || `Project ID ${expense.project_id}`}
           />
         ) : null}
-        {expense.description ? <Row styles={styles} label="Description" value={expense.description} last /> : null}
+        {expense.claim_for ? <Row styles={styles} label="Claim For" value={expense.claim_for} /> : null}
+        <Row styles={styles} label="Period" value={`${expense.from_date} to ${expense.to_date}`} />
+        <Row
+          styles={styles}
+          label="Total"
+          value={`$${expense.amount_usd} USD`}
+          last={!expense.description}
+        />
+        {expense.description ? <Row styles={styles} label="Note" value={expense.description} last /> : null}
       </View>
 
-      {expense.attachment_filename ? (
-        <View style={styles.attachedRow}>
-          <View style={[styles.fileBadge, { backgroundColor: badge.bg }]}>
-            <Text style={[styles.fileBadgeText, { color: badge.text }]}>{badge.label}</Text>
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.attachmentName} numberOfLines={1}>
-              {expense.attachment_filename}
-            </Text>
-            <Text style={styles.attachmentSub}>Attached</Text>
-          </View>
-          <TouchableOpacity onPress={handlePreviewAttachment} disabled={previewing} style={{ padding: 4 }}>
-            {previewing ? <ActivityIndicator color={colors.primary} /> : <Text style={styles.viewLink}>View</Text>}
-          </TouchableOpacity>
-        </View>
-      ) : null}
+      {/* THE BILLS. Each with its own receipt, because approving a claim means
+          approving every line in it. */}
+      <View style={styles.billsHeader}>
+        <Text style={styles.label}>
+          {billsLoading ? 'Bills' : bills.length === 1 ? '1 Bill' : `${bills.length} Bills`}
+        </Text>
+      </View>
+
+      {billsLoading ? (
+        <ActivityIndicator color={colors.primary} style={{ marginVertical: 14 }} />
+      ) : (
+        bills.map((b) => {
+          const bBadge = b.attachment_filename ? fileBadgeForName(b.attachment_filename) : null;
+          return (
+            <View key={b.id} style={styles.attachedRow}>
+              {b.has_receipt === 'Y' && bBadge ? (
+                <View style={[styles.fileBadge, { backgroundColor: bBadge.bg }]}>
+                  <Text style={[styles.fileBadgeText, { color: bBadge.text }]}>{bBadge.label}</Text>
+                </View>
+              ) : (
+                <View style={[styles.fileBadge, { backgroundColor: colors.bg }]}>
+                  <Text style={[styles.fileBadgeText, { color: colors.textFaint }]}>{b.item_no}</Text>
+                </View>
+              )}
+              <View style={{ flex: 1 }}>
+                <Text style={styles.attachmentName} numberOfLines={1}>
+                  {b.type}
+                  {b.bill_no ? ` · ${b.bill_no}` : ''}
+                </Text>
+                <Text style={styles.attachmentSub} numberOfLines={1}>
+                  {b.amount} {b.currency}
+                  {b.amount_usd != null ? `  ·  $${b.amount_usd}` : ''}
+                  {'  ·  '}
+                  {b.from_date}
+                </Text>
+                {b.description ? (
+                  <Text style={styles.attachmentSub} numberOfLines={2}>
+                    {b.description}
+                  </Text>
+                ) : null}
+              </View>
+              {b.has_receipt === 'Y' ? (
+                <TouchableOpacity
+                  onPress={() => handlePreviewBill(b)}
+                  disabled={previewing === b.id}
+                  style={{ padding: 4 }}
+                >
+                  {previewing === b.id ? (
+                    <ActivityIndicator color={colors.primary} />
+                  ) : (
+                    <Text style={styles.viewLink}>View</Text>
+                  )}
+                </TouchableOpacity>
+              ) : (
+                <Text style={styles.noReceipt}>no receipt</Text>
+              )}
+            </View>
+          );
+        })
+      )}
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
 
@@ -317,6 +365,8 @@ function createStyles(colors) {
   fileBadgeText: { fontSize: 9.5, fontWeight: '800' },
   attachmentName: { fontSize: 13.5, fontWeight: '700', color: colors.text },
   attachmentSub: { fontSize: 11, color: colors.textFaint, marginTop: 1 },
+  billsHeader: { marginTop: 18 },
+  noReceipt: { fontSize: 11, color: colors.textFaint, fontStyle: 'italic', paddingHorizontal: 4 },
   viewLink: { color: colors.primary, fontWeight: '700', fontSize: 13 },
 
   error: { color: colors.red, marginBottom: 12, fontWeight: '600' },

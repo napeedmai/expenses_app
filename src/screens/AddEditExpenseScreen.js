@@ -1,22 +1,30 @@
-// Add/Edit Expense screen.
+// Add / Edit an expense CLAIM.
 //
-// Project field: picker of active projects this employee is allocated to
-// (PROJECT_ALLOCATION_WB joined to PROJECTMASTER server-side), falling back
-// to a plain numeric box if there are no matching allocations.
-// Type field: picker from the fixed EXPENSE_TYPES list.
-// Date fields: real date pickers, shown as MM/DD/YYYY, stored as
-// YYYY-MM-DD (see src/components/DateField.js for why).
+// A claim is the header — who, which project, what it was for — plus a list of
+// BILLS, each with its own dates, currency, amount and receipt. The old version
+// of this screen was one claim = one bill; see MULTI_BILL_PLAN.md and
+// db/64..66 for the change.
 //
-// empId now comes from the session context, not route.params — see
-// src/SessionContext.js.
+// The claim's USD total is NOT computed here. recalc_claim_totals sums the bills
+// server-side and GET /expenses/{id} returns it. The list below shows the sum of
+// what it just fetched, which is the same number by construction — two places
+// deciding what a claim is worth is how they end up disagreeing.
+//
+//
+// ORDER OF OPERATIONS, AND WHY
+// ----------------------------
+// A bill cannot exist without a claim to hang off, so "Add Bill" on an unsaved
+// claim saves the header first and then adds the bill. The user sees one action.
+//
+// Saving a bill is likewise two calls: POST the bill, then upload the receipt
+// against the id that comes back. That is what makes "attach the file before
+// saving" work — the file sits in BillSheet's state until there is a row for it.
+// If the upload fails the bill still exists without a receipt, which is a valid
+// state; losing the typing would not be.
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   ActivityIndicator,
-  Alert,
-  Image,
-  Modal,
-  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -24,58 +32,34 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import * as DocumentPicker from 'expo-document-picker';
-// Using the /legacy import on purpose — SDK 54 replaced downloadAsync with
-// a new File/Directory-class API, but the legacy path keeps the same
-// downloadAsync()/cacheDirectory calls working without a rewrite.
-import * as FileSystem from 'expo-file-system/legacy';
-import * as Sharing from 'expo-sharing';
+import { Ionicons } from '@expo/vector-icons';
 import { useSession } from '../SessionContext';
 import { useTheme } from '../ThemeContext';
 import PickerField from '../components/PickerField';
-import DateField from '../components/DateField';
-import { EXPENSE_TYPES } from '../constants/expenseTypes';
-import { radius, shadow, fileBadgeForName, stageLabel } from '../theme';
-import { Ionicons } from '@expo/vector-icons';
+import BillSheet from '../components/BillSheet';
+import { radius, shadow, stageLabel, fileBadgeForName } from '../theme';
 import { showAlert } from '../utils/alert';
-import { openAttachment } from '../utils/openAttachment';
 import {
   getExpense,
   createDraft,
   updateExpense,
   deleteExpense,
   submitExpense,
-  uploadAttachment,
   listMyProjects,
-  getAttachmentUrl,
-  getAttachmentDownloadHeaders,
   listCurrencies,
-  getExchangeRate,
+  listItems,
+  addItem,
+  updateItem,
+  deleteItem,
+  uploadItemAttachment,
 } from '../api/client';
 
 const EDITABLE_STATUSES = ['DRAFT', 'REVISION_REQUESTED'];
+const MAX_BILLS = 20;
 
-// Everything except Bill Date is required before an expense can be
-// submitted (Bill No./Project/Type/Description used to be optional). Draft
-// saves still only require From Date/To Date/Amount — that's a hard
-// backend requirement (the draft-creation endpoint rejects a request
-// without those three), not a UX choice, so it stays as-is.
-const ALLOWED_ATTACHMENT_EXTENSIONS = ['pdf', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'csv', 'rar'];
-
-const MAX_ATTACHMENT_BYTES = 1 * 1024 * 1024; // 1 MB
-
-// Must match the backend default in 46_currency_endpoints.sql and the
-// backfill value in 45_currency_conversion.sql.
-const DEFAULT_CURRENCY = 'INR';
-
-// A random id generated once per "new expense" attempt (see the
-// clientRequestId state below) and sent with every draft-creation request
-// for that attempt, even across retries. This lets the backend recognize
-// "this is the same save attempt as before" and return the existing draft
-// instead of inserting a duplicate — see 37_idempotent_draft_creation.sql.
-// Without this, a lost/timed-out response (the intermittent 555 errors)
-// looked like a failure on the phone even when the draft had actually been
-// created, so tapping Save/Submit again created a second, identical draft.
+// One id per "new claim" attempt, reused across retries, so a lost response
+// cannot produce two claims. See 37_idempotent_draft_creation.sql — without it
+// a timed-out save looked like a failure even when the row had been created.
 function generateClientRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -85,789 +69,583 @@ export default function AddEditExpenseScreen({ route, navigation }) {
   const { colors } = useTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const empId = session.empId;
-  const { expenseId: initialExpenseId } = route.params;
+  const { expenseId: initialExpenseId } = route.params || {};
 
-  // Only needed while creating a brand-new expense — once expenseId is set
-  // (either because we opened an existing one, or because a draft was just
-  // created), further saves go through updateExpense, which doesn't need
-  // it. useState's initializer runs exactly once per screen instance, so
-  // this stays the same value across every retry on this screen.
-  const [clientRequestId] = useState(() => (initialExpenseId ? null : generateClientRequestId()));
+  const [clientRequestId] = useState(() =>
+    initialExpenseId ? null : generateClientRequestId()
+  );
 
   const [expenseId, setExpenseId] = useState(initialExpenseId);
   const [status, setStatus] = useState('DRAFT');
   const [currentStage, setCurrentStage] = useState(null);
-  const [projectName, setProjectName] = useState(null);
   const [managerName, setManagerName] = useState(null);
   const [financeManagerName, setFinanceManagerName] = useState(null);
+
+  const [projectId, setProjectId] = useState('');
+  const [claimFor, setClaimFor] = useState('');
+
+  const [items, setItems] = useState([]);
+  const [myProjects, setMyProjects] = useState(null);
+  const [currencies, setCurrencies] = useState([]);
+
   const [loading, setLoading] = useState(!!initialExpenseId);
   const [saving, setSaving] = useState(false);
+  const [billSaving, setBillSaving] = useState(false);
   const [error, setError] = useState(null);
-  const [attachmentInfo, setAttachmentInfo] = useState(null);
-  const [previewing, setPreviewing] = useState(false);
-  const [previewImageUri, setPreviewImageUri] = useState(null);
 
-  const [billNo, setBillNo] = useState('');
-  const [billDate, setBillDate] = useState('');
-  const [fromDate, setFromDate] = useState('');
-  const [toDate, setToDate] = useState('');
-  const [projectId, setProjectId] = useState('');
-  const [type, setType] = useState('');
-  const [amount, setAmount] = useState('');
-  const [description, setDescription] = useState('');
-
-  const [myProjects, setMyProjects] = useState(null); // null = still loading, [] = loaded but empty
-  const [projectsError, setProjectsError] = useState(false);
-
-  // Currency + live USD conversion. DEFAULT_CURRENCY matches the backend's
-  // fallback for requests that omit it (46_currency_endpoints.sql) and the
-  // value existing rows were backfilled with — keep all three in step.
-  const [currency, setCurrency] = useState(DEFAULT_CURRENCY);
-  const [currencies, setCurrencies] = useState([]);
-  const [conversion, setConversion] = useState(null); // { exchange_rate, amount_usd, rate_month }
-  const [conversionError, setConversionError] = useState(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [editingBill, setEditingBill] = useState(null);
 
   const isLocked = !!expenseId && !EDITABLE_STATUSES.includes(status);
 
+  // ---- loading ----
+
   useEffect(() => {
     listMyProjects(empId)
-      .then((data) => setMyProjects(Array.isArray(data.items) ? data.items : []))
-      .catch(() => {
-        // Fall back to a plain numeric box rather than blocking the user
-        // if this lookup isn't working yet.
-        setProjectsError(true);
-        setMyProjects([]);
-      });
-  }, [empId]);
-
-  // The dropdown only ever offers currencies the server can actually price,
-  // so a user can't pick one that fails on save. If the lookup fails we fall
-  // back to the default alone rather than leaving an empty picker.
-  useEffect(() => {
+      .then((d) => setMyProjects(Array.isArray(d.items) ? d.items : []))
+      .catch(() => setMyProjects([]));
     listCurrencies(empId)
-      .then((data) => {
-        const items = Array.isArray(data.items) ? data.items : [];
-        setCurrencies(items.length ? items : [{ currency: DEFAULT_CURRENCY }]);
+      .then((d) => {
+        const list = Array.isArray(d.items) ? d.items : [];
+        setCurrencies(list.length ? list : [{ currency: 'INR' }]);
       })
-      .catch(() => setCurrencies([{ currency: DEFAULT_CURRENCY }]));
+      .catch(() => setCurrencies([{ currency: 'INR' }]));
   }, [empId]);
 
-  // Recalculate whenever the amount, currency or period start changes.
-  // from_date drives which month's rate applies, so editing it can change
-  // the converted figure even when the amount hasn't moved.
-  //
-  // Debounced because this fires on every keystroke in the amount field.
+  const loadBills = useCallback(
+    async (id) => {
+      const d = await listItems(empId, id);
+      setItems(Array.isArray(d.items) ? d.items : []);
+    },
+    [empId]
+  );
+
   useEffect(() => {
-    if (!amount || !currency) {
-      setConversion(null);
-      setConversionError(null);
-      return;
-    }
-
+    if (!initialExpenseId) return;
     let cancelled = false;
-    const timer = setTimeout(() => {
-      getExchangeRate(empId, currency, fromDate || undefined, amount)
-        .then((data) => {
-          if (cancelled) return;
-          setConversion(data);
-          setConversionError(null);
-        })
-        .catch((e) => {
-          if (cancelled) return;
-          setConversion(null);
-          setConversionError(e.message || 'Could not fetch the exchange rate.');
-        });
-    }, 400);
-
+    (async () => {
+      try {
+        const claim = await getExpense(empId, initialExpenseId);
+        if (cancelled) return;
+        setStatus(claim.status || 'DRAFT');
+        setCurrentStage(claim.current_stage || null);
+        setProjectId(claim.project_id != null ? String(claim.project_id) : '');
+        setClaimFor(claim.claim_for || '');
+        setManagerName(claim.manager_name || null);
+        setFinanceManagerName(claim.finance_manager_name || null);
+        await loadBills(initialExpenseId);
+      } catch (e) {
+        if (!cancelled) setError(e.message || 'Could not load this claim.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
     return () => {
       cancelled = true;
-      clearTimeout(timer);
     };
-  }, [empId, amount, currency, fromDate]);
+  }, [empId, initialExpenseId, loadBills]);
 
-  const loadExisting = useCallback(async () => {
-    if (!initialExpenseId) return;
-    try {
-      const data = await getExpense(empId, initialExpenseId);
-      setStatus(data.status);
-      setCurrentStage(data.current_stage || null);
-      setProjectName(data.project_name || null);
-      setManagerName(data.manager_name || null);
-      setFinanceManagerName(data.finance_manager_name || null);
-      setBillNo(data.bill_no || '');
-      setBillDate(data.bill_date || '');
-      setFromDate(data.from_date || '');
-      setToDate(data.to_date || '');
-      setProjectId(data.project_id != null ? String(data.project_id) : '');
-      setType(data.type || '');
-      setAmount(data.amount != null ? String(data.amount) : '');
-      setCurrency(data.currency || DEFAULT_CURRENCY);
-      setDescription(data.description || '');
-      setAttachmentInfo(
-        data.attachment_filename ? { name: data.attachment_filename, alreadyUploaded: true } : null
-      );
-    } catch (e) {
-      setError(e.message || 'Failed to load this expense.');
-    } finally {
-      setLoading(false);
-    }
-  }, [empId, initialExpenseId]);
+  // ---- the claim header ----
 
-  useEffect(() => {
-    loadExisting();
-  }, [loadExisting]);
-
-  function buildPayload() {
+  function headerPayload() {
     return {
-      bill_no: billNo || null,
-      bill_date: billDate || null,
-      from_date: fromDate,
-      to_date: toDate,
       project_id: projectId ? Number(projectId) : null,
-      type: type || null,
-      amount: amount ? Number(amount) : null,
-      currency: currency || DEFAULT_CURRENCY,
-      description: description || null,
-      // Only relevant to createDraft (expenseId is still null at that
-      // point) — updateExpense doesn't need it, and the backend ignores it
-      // harmlessly either way since PUT doesn't read this field.
-      client_request_id: expenseId ? undefined : clientRequestId,
+      claim_for: claimFor || null,
+      ...(clientRequestId ? { client_request_id: clientRequestId } : {}),
     };
   }
 
-  // Everything except Bill Date — used to gate Submit (not Save Draft).
-  function findMissingRequiredField() {
-    if (!billNo.trim()) return 'Bill No.';
-    if (!fromDate) return 'From Date';
-    if (!toDate) return 'To Date';
-    if (!projectId) return 'Project';
-    if (!type) return 'Type';
-    if (!amount) return 'Amount';
-    if (!description.trim()) return 'Description';
-    if (!attachmentInfo) return 'Receipt Attachment';
-    return null;
-  }
-
-  // Shared by Save Draft, Submit, and (now) attaching a file on a brand-new
-  // expense: creates the draft if it doesn't exist yet, or updates it if it
-  // does. Always safe to call repeatedly — retries reuse the same
-  // clientRequestId, so a retry after a lost/timed-out response updates the
-  // same draft instead of creating a duplicate (see
-  // 37_idempotent_draft_creation.sql).
-  async function ensureDraftSaved() {
+  // Returns the claim id, creating the claim if this is the first save. Every
+  // action that needs a claim to exist goes through here rather than each one
+  // deciding for itself whether to create.
+  async function ensureClaim() {
     if (expenseId) {
-      await updateExpense(empId, expenseId, buildPayload());
+      await updateExpense(empId, expenseId, headerPayload());
       return expenseId;
     }
-    if (!fromDate || !toDate || !amount) {
-      throw new Error('From Date, To Date, and Amount are required.');
+    if (!projectId) {
+      throw new Error('Choose a project first — it decides who approves this claim.');
     }
-    const result = await createDraft(empId, buildPayload());
-    // Guard against a malformed/empty response silently producing a bad id
-    // (e.g. JS `undefined` getting interpolated into a later request URL as
-    // the literal text "undefined", which is exactly what caused a
-    // confusing ORA-01722 further down the line instead of a clear error
-    // here, where the actual problem is).
-    const newId = result && result.id;
-    if (newId === undefined || newId === null || Number.isNaN(Number(newId))) {
-      throw new Error(
-        "The server didn't return a valid expense id after saving. Check My Expenses — a draft may have already been created — before trying again."
-      );
-    }
-    setExpenseId(newId);
-    setStatus('DRAFT');
-    return newId;
+    const created = await createDraft(empId, headerPayload());
+    const id = created.id;
+    setExpenseId(id);
+    return id;
   }
 
-  async function handleSaveDraft() {
-    if (!fromDate || !toDate || !amount) {
-      showAlert('Missing fields', 'From Date, To Date, and Amount are required.');
-      return;
-    }
+  async function handleSaveHeader() {
     setSaving(true);
     setError(null);
     try {
-      await ensureDraftSaved();
-      showAlert('Saved', 'Draft saved successfully.');
+      await ensureClaim();
+      showAlert('Saved', 'Your claim has been saved as a draft.');
     } catch (e) {
-      const message = e.message || 'Failed to save.';
-      setError(message);
-      showAlert('Save failed', message);
+      setError(e.message || 'Could not save this claim.');
     } finally {
       setSaving(false);
     }
   }
 
-  async function handlePickAndUploadAttachment() {
-    // Back to requiring the expense to already be saved as a draft before
-    // attaching a file — simpler and more predictable than auto-saving
-    // behind the scenes.
-    if (!expenseId) {
-      showAlert('Save first', 'Save this as a draft before attaching a file.');
-      return;
-    }
+  // ---- bills ----
 
-    // Wrapped in try/catch — getDocumentAsync() failing for any reason (a
-    // missing native module, a denied permission, etc.) used to fail
-    // silently with no error shown at all, so tapping "attach" would just
-    // appear to do nothing.
-    let result;
-    try {
-      result = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
-    } catch (e) {
-      const message = e.message || 'Failed to open the file/photo picker.';
-      setError(message);
-      showAlert('Could not open picker', message);
-      return;
-    }
-    if (result.canceled) return;
-
-    const file = result.assets[0];
-
-    const ext = (file.name || '').split('.').pop().toLowerCase();
-    if (!ALLOWED_ATTACHMENT_EXTENSIONS.includes(ext)) {
+  async function handleOpenSheet(bill) {
+    if (isLocked) return;
+    if (!bill && items.length >= MAX_BILLS) {
       showAlert(
-        'File type not allowed',
-        `Allowed file types: ${ALLOWED_ATTACHMENT_EXTENSIONS.join(', ').toUpperCase()}.`
+        'That is the limit',
+        `A claim can hold ${MAX_BILLS} bills. Submit this one and start another.`
       );
       return;
     }
-    if (typeof file.size === 'number' && file.size > MAX_ATTACHMENT_BYTES) {
-      showAlert(
-        'File too large',
-        `Maximum file size is 1 MB. This file is ${(file.size / (1024 * 1024)).toFixed(2)} MB — please choose a smaller file.`
-      );
-      return;
-    }
+    setEditingBill(bill || null);
+    setSheetOpen(true);
+  }
 
-    setSaving(true);
+  async function handleSaveBill(fields, pickedFile) {
+    setBillSaving(true);
     setError(null);
     try {
-      await uploadAttachment(empId, expenseId, file);
-      setAttachmentInfo({ name: file.name, alreadyUploaded: true });
-      showAlert('Uploaded', 'Attachment uploaded successfully.');
+      const id = await ensureClaim();
+
+      let itemId;
+      if (editingBill && editingBill.id) {
+        await updateItem(empId, id, editingBill.id, fields);
+        itemId = editingBill.id;
+      } else {
+        const created = await addItem(empId, id, fields);
+        itemId = created.id;
+      }
+
+      // Separate call, and separately reported: a failed upload must not lose
+      // the bill that was just saved successfully.
+      if (pickedFile) {
+        try {
+          await uploadItemAttachment(empId, id, itemId, pickedFile);
+        } catch (e) {
+          showAlert(
+            'Bill saved, receipt did not upload',
+            `${e.message || 'The upload failed.'} The bill is saved — open it again to retry the receipt.`
+          );
+        }
+      }
+
+      await loadBills(id);
+      setSheetOpen(false);
+      setEditingBill(null);
     } catch (e) {
-      // The backend returns a clear message for disallowed file types too
-      // (pdf, jpg, jpeg, png, xlsx, xls, csv, rar only).
-      const message = e.message || 'Failed to upload attachment.';
-      setError(message);
-      showAlert('Upload failed', message);
+      // Shown inside the sheet, which stays open so the typing survives.
+      showAlert('Could not save this bill', e.message || 'Please try again.');
     } finally {
-      setSaving(false);
+      setBillSaving(false);
     }
   }
 
-  function handleDelete() {
-    showAlert(
-      'Delete expense',
-      'Are you sure you want to delete this draft? This cannot be undone.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            setSaving(true);
-            setError(null);
-            try {
-              await deleteExpense(empId, expenseId);
-              navigation.goBack();
-            } catch (e) {
-              const message = e.message || 'Failed to delete.';
-              setError(message);
-              showAlert('Delete failed', message);
-              setSaving(false);
-            }
-          },
+  function handleDeleteBill(bill) {
+    showAlert('Remove this bill?', `Bill ${bill.item_no}: ${bill.type} — ${bill.amount} ${bill.currency}`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Remove',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await deleteItem(empId, expenseId, bill.id);
+            await loadBills(expenseId);
+          } catch (e) {
+            showAlert('Could not remove it', e.message || 'Please try again.');
+          }
         },
-      ]
-    );
+      },
+    ]);
   }
 
-  // Downloads the attachment to a local temp file (with the same auth
-  // headers every other request uses) and either shows it in-app (images)
-  // or hands it to the OS's own viewer/share sheet (everything else — PDF,
-  // Excel, etc.), since RN has no built-in universal file viewer.
-  async function handlePreviewAttachment() {
-    setPreviewing(true);
-    setError(null);
-    try {
-      const headers = await getAttachmentDownloadHeaders(empId);
-
-      await openAttachment({
-        url: getAttachmentUrl(expenseId),
-        headers,
-        filename: (attachmentInfo && attachmentInfo.name) || `attachment-${expenseId}`,
-        onImage: setPreviewImageUri,
-      });
-    } catch (e) {
-      const message = e.message || 'Failed to preview attachment.';
-      setError(message);
-      showAlert('Preview failed', message);
-    } finally {
-      setPreviewing(false);
-    }
-  }
+  // ---- submit / delete ----
 
   async function handleSubmit() {
-    const missingField = findMissingRequiredField();
-    if (missingField) {
-      showAlert('Missing fields', `${missingField} is required. Every field except Bill Date must be filled in before you can submit.`);
-      return;
-    }
     setSaving(true);
     setError(null);
-    let idToSubmit;
     try {
-      idToSubmit = await ensureDraftSaved();
-    } catch (e) {
-      // Failed before we even got to the submit step — nothing saved as
-      // SUBMITTED, but a draft may now exist (if createDraft succeeded and
-      // it was the following updateExpense-on-retry that failed instead).
-      const message = e.message || 'Failed to save this expense.';
-      setError(message);
-      showAlert('Save failed', message);
-      setSaving(false);
-      return;
-    }
-
-    try {
-      await submitExpense(empId, idToSubmit);
-      showAlert('Submitted', 'Expense submitted for approval.', [
+      const id = await ensureClaim();
+      await submitExpense(empId, id);
+      showAlert('Submitted', 'Your claim has gone to your project manager.', [
         { text: 'OK', onPress: () => navigation.goBack() },
       ]);
     } catch (e) {
-      // The draft itself DID save successfully above — only the actual
-      // submit step failed. Say so explicitly, otherwise it looks like
-      // nothing happened and the same details get submitted again as a
-      // second, duplicate draft.
-      const message = e.message || 'Failed to submit.';
-      setError(message);
-      showAlert(
-        'Saved as draft, but not submitted',
-        `Your details were saved, but submitting for approval failed: ${message}\n\nTap Submit Claim again to retry — you won't create a duplicate.`
-      );
+      // The submit handler returns 409 with a specific reason — no bills, a
+      // bill without a receipt (named), or no Claim For. Show it as-is rather
+      // than replacing it with something vaguer.
+      setError(e.message || 'Could not submit this claim.');
     } finally {
       setSaving(false);
     }
   }
 
-  function fieldStyle(locked) {
-    return [styles.input, locked ? styles.inputLocked : null];
+  function handleDeleteClaim() {
+    showAlert('Delete this claim?', 'The claim and all of its bills will be removed.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await deleteExpense(empId, expenseId);
+            navigation.goBack();
+          } catch (e) {
+            showAlert('Could not delete it', e.message || 'Please try again.');
+          }
+        },
+      },
+    ]);
   }
+
+  // ---- derived ----
+
+  const totalUsd = items.reduce((sum, b) => sum + (Number(b.amount_usd) || 0), 0);
+  const missingReceipts = items.filter((b) => b.has_receipt !== 'Y').length;
+  const canSubmit =
+    !isLocked && items.length > 0 && missingReceipts === 0 && !!claimFor && !!projectId;
 
   if (loading) {
     return (
-      <View style={styles.center}>
+      <View style={styles.centre}>
         <ActivityIndicator size="large" color={colors.primary} />
       </View>
     );
   }
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={{ padding: 16 }}>
-      {expenseId && status !== 'DRAFT' ? (
-        <View style={styles.progressCard}>
-          <Text style={styles.progressTitle}>{stageLabel(status, currentStage)}</Text>
-          {projectName ? <Text style={styles.progressLine}>Project: {projectName}</Text> : null}
-          {managerName ? <Text style={styles.progressLine}>Project Manager: {managerName}</Text> : null}
-          {financeManagerName ? (
-            <Text style={styles.progressLine}>Finance Manager: {financeManagerName}</Text>
-          ) : null}
-        </View>
-      ) : null}
+    <View style={styles.container}>
+      <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 120 }}>
+        {error ? <Text style={styles.error}>{error}</Text> : null}
 
-      {isLocked ? (
-        <View style={styles.lockedBanner}>
-          <Text style={styles.lockedText}>
-            This expense is {stageLabel(status, currentStage)} and can no longer be edited or deleted.
-          </Text>
-        </View>
-      ) : null}
+        {expenseId ? (
+          <View style={styles.statusRow}>
+            <Text style={styles.statusText}>{stageLabel(status, currentStage)}</Text>
+            {isLocked ? (
+              <Text style={styles.lockedNote}>Awaiting review — not editable</Text>
+            ) : null}
+          </View>
+        ) : null}
 
-      {error ? <Text style={styles.error}>{error}</Text> : null}
-
-      <View style={styles.row2}>
-        <View style={styles.halfField}>
-          <Field label="Bill No. *" styles={styles}>
-            <TextInput style={fieldStyle(isLocked)} value={billNo} onChangeText={setBillNo} editable={!isLocked} />
-          </Field>
-        </View>
-        <View style={styles.halfField}>
-          <Field label="Bill Date" styles={styles}>
-            <DateField
-              value={billDate}
-              onChange={setBillDate}
-              disabled={isLocked}
-              fieldStyle={fieldStyle(isLocked)}
-            />
-          </Field>
-        </View>
-      </View>
-
-      <View style={styles.row2}>
-        <View style={styles.halfField}>
-          <Field label="From Date *" styles={styles}>
-            <DateField
-              value={fromDate}
-              onChange={setFromDate}
-              disabled={isLocked}
-              fieldStyle={fieldStyle(isLocked)}
-            />
-          </Field>
-        </View>
-        <View style={styles.halfField}>
-          <Field label="To Date *" styles={styles}>
-            <DateField
-              value={toDate}
-              onChange={setToDate}
-              disabled={isLocked}
-              fieldStyle={fieldStyle(isLocked)}
-            />
-          </Field>
-        </View>
-      </View>
-
-      <Field label="Project *" styles={styles}>
-        {myProjects && myProjects.length > 0 && !projectsError ? (
+        {/* ---- claim header ---- */}
+        <Text style={styles.sectionLabel}>Claim</Text>
+        <View style={styles.card}>
+          <Text style={styles.label}>Project</Text>
           <PickerField
-            options={myProjects}
+            options={myProjects || []}
             valueKey="project_id"
             labelKey="project_name"
             value={projectId}
             onSelect={(v) => setProjectId(String(v))}
             disabled={isLocked}
-            placeholder="Select a project..."
-            fieldStyle={fieldStyle(isLocked)}
+            placeholder={myProjects === null ? 'Loading…' : 'Select a project'}
+            fieldStyle={styles.input}
           />
-        ) : myProjects === null ? (
-          <ActivityIndicator />
-        ) : (
-          // No allocations found (or the lookup failed) — fall back to a
-          // plain numeric box so the employee isn't blocked from submitting.
-          <>
-            <Text style={styles.helperText}>
-              {projectsError
-                ? "Couldn't load your assigned projects — enter the Project ID manually."
-                : 'No assigned projects found — enter the Project ID manually.'}
-            </Text>
-            <TextInput
-              style={fieldStyle(isLocked)}
-              value={projectId}
-              onChangeText={setProjectId}
-              editable={!isLocked}
-              keyboardType="number-pad"
-            />
-          </>
-        )}
-      </Field>
 
-      <Field label="Type *" styles={styles}>
-        <PickerField
-          options={EXPENSE_TYPES}
-          valueKey="id"
-          labelKey="label"
-          value={type}
-          onSelect={setType}
-          disabled={isLocked}
-          placeholder="Select a type..."
-          fieldStyle={fieldStyle(isLocked)}
-        />
-      </Field>
-
-      <Field label="Amount *" styles={styles}>
-        <View style={styles.amountRow}>
+          <Text style={styles.label}>Claim For</Text>
           <TextInput
-            style={[fieldStyle(isLocked), { flex: 1 }]}
-            value={amount}
-            onChangeText={setAmount}
+            style={styles.input}
+            value={claimFor}
+            onChangeText={setClaimFor}
             editable={!isLocked}
-            keyboardType="decimal-pad"
+            placeholder="e.g. Client visit — Chennai"
+            placeholderTextColor={colors.textFaint}
           />
-          <View style={{ width: 108 }}>
-            <PickerField
-              options={currencies}
-              valueKey="currency"
-              labelKey="currency"
-              value={currency}
-              onSelect={setCurrency}
-              disabled={isLocked}
-              placeholder="CUR"
-              fieldStyle={fieldStyle(isLocked)}
-            />
-          </View>
-        </View>
 
-        {/* Converted amount. Shown for every currency including USD — a
-            silent 1:1 line is clearer than the figure disappearing and
-            leaving the user unsure whether conversion happened.
-
-            rate_month is the month the rate ACTUALLY came from, which is not
-            always the month of the expense: if no rate has been loaded for
-            that month, the server falls back to the current open rate and
-            sets is_fallback. Saying "JUN-2026 rate" when the number came
-            from October would be a lie an approver might act on, so the
-            fallback is called out explicitly. */}
-        {conversionError ? (
-          <Text style={styles.conversionError}>{conversionError}</Text>
-        ) : conversion ? (
-          <>
-            <Text style={styles.conversionNote}>
-              ≈ <Text style={styles.conversionUsd}>${conversion.amount_usd}</Text> USD
-              {'  ·  '}1 {conversion.currency} = ${conversion.exchange_rate}
-              {conversion.rate_month ? `  ·  ${conversion.rate_month} rate` : ''}
-            </Text>
-            {conversion.is_fallback === 'Y' ? (
-              <Text style={styles.conversionWarn}>
-                No rate loaded for {conversion.requested_month} — using the current{' '}
-                {conversion.rate_month} rate.
-              </Text>
-            ) : null}
-          </>
-        ) : null}
-      </Field>
-
-      <Field label="Description *" styles={styles}>
-        <TextInput
-          style={[fieldStyle(isLocked), { height: 80 }]}
-          value={description}
-          onChangeText={setDescription}
-          editable={!isLocked}
-          multiline
-        />
-      </Field>
-
-      <Field label="Receipt Attachment *" styles={styles}>
-        {attachmentInfo ? (
-          <View style={styles.attachedRow}>
-            <View style={[styles.fileBadge, { backgroundColor: fileBadgeForName(attachmentInfo.name).bg }]}>
-              <Text style={[styles.fileBadgeText, { color: fileBadgeForName(attachmentInfo.name).text }]}>
-                {fileBadgeForName(attachmentInfo.name).label}
+          {/* Read-only. The reporting manager comes from the project, and the
+              finance manager from get_finance_manager_empid() — both resolved
+              server-side at submit. Shown so the person knows who will see it. */}
+          <View style={styles.readonlyRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.readonlyLabel}>Reporting Manager</Text>
+              <Text style={styles.readonlyValue}>
+                {managerName || (expenseId ? 'Set when you submit' : '—')}
               </Text>
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={styles.attachmentName} numberOfLines={1}>{attachmentInfo.name}</Text>
-              <Text style={styles.attachmentSub}>Attached</Text>
+              <Text style={styles.readonlyLabel}>Manager (Finance)</Text>
+              <Text style={styles.readonlyValue}>
+                {financeManagerName || (expenseId ? 'Set when you submit' : '—')}
+              </Text>
             </View>
-            {attachmentInfo.alreadyUploaded && (
-              <TouchableOpacity onPress={handlePreviewAttachment} disabled={previewing} style={{ padding: 4 }}>
-                {previewing ? (
-                  <ActivityIndicator color={colors.primary} />
-                ) : (
-                  <Text style={styles.viewLink}>View</Text>
-                )}
-              </TouchableOpacity>
-            )}
+          </View>
+        </View>
+
+        {/* ---- bills ---- */}
+        <View style={styles.billsHeader}>
+          <Text style={styles.sectionLabel}>Expense Details</Text>
+          <Text style={styles.billCount}>
+            {items.length} of {MAX_BILLS}
+          </Text>
+        </View>
+
+        {items.length === 0 ? (
+          <View style={styles.empty}>
+            <Ionicons name="receipt-outline" size={26} color={colors.textFaint} />
+            <Text style={styles.emptyText}>No bills yet.</Text>
+            <Text style={styles.emptyHint}>Add one for each receipt you are claiming.</Text>
           </View>
         ) : (
-          !isLocked && (
-            <TouchableOpacity
-              style={styles.dropzone}
-              onPress={handlePickAndUploadAttachment}
-              disabled={saving}
-            >
-              <Ionicons name="attach-outline" size={22} color={colors.textFaint} />
-              <Text style={styles.dropzoneText}>
-                {expenseId ? 'Tap to attach photo or file' : 'Save draft first to attach a file'}
-              </Text>
-              <Text style={styles.dropzoneHint}>PDF, JPG, JPEG, PNG, XLSX, XLS, CSV, RAR up to 1MB</Text>
-            </TouchableOpacity>
-          )
+          items.map((b) => {
+            const badge = b.attachment_filename ? fileBadgeForName(b.attachment_filename) : null;
+            return (
+              <TouchableOpacity
+                key={b.id}
+                style={styles.billRow}
+                onPress={() => handleOpenSheet(b)}
+                disabled={isLocked}
+                activeOpacity={0.7}
+              >
+                <View style={styles.billNo}>
+                  <Text style={styles.billNoText}>{b.item_no}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.billType}>{b.type}</Text>
+                  <Text style={styles.billMeta} numberOfLines={1}>
+                    {b.bill_no ? `${b.bill_no} · ` : ''}
+                    {b.from_date}
+                    {b.to_date && b.to_date !== b.from_date ? ` – ${b.to_date}` : ''}
+                  </Text>
+                  <View style={styles.billTags}>
+                    {b.has_receipt === 'Y' ? (
+                      <View style={[styles.tag, badge ? { backgroundColor: badge.bg } : null]}>
+                        <Text style={[styles.tagText, badge ? { color: badge.text } : null]}>
+                          {badge ? badge.label : 'RECEIPT'}
+                        </Text>
+                      </View>
+                    ) : (
+                      <View style={[styles.tag, styles.tagMissing]}>
+                        <Text style={[styles.tagText, styles.tagMissingText]}>NO RECEIPT</Text>
+                      </View>
+                    )}
+                  </View>
+                </View>
+                <View style={styles.billAmounts}>
+                  <Text style={styles.billAmount}>
+                    {b.amount} {b.currency}
+                  </Text>
+                  <Text style={styles.billUsd}>${b.amount_usd}</Text>
+                </View>
+                {!isLocked ? (
+                  <TouchableOpacity
+                    onPress={() => handleDeleteBill(b)}
+                    style={styles.removeBtn}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  >
+                    <Ionicons name="trash-outline" size={17} color={colors.red} />
+                  </TouchableOpacity>
+                ) : null}
+              </TouchableOpacity>
+            );
+          })
         )}
 
-        {attachmentInfo && !isLocked && (
-          <TouchableOpacity
-            style={[styles.secondaryButton, { marginTop: 8 }]}
-            onPress={handlePickAndUploadAttachment}
-          >
-            <Text style={styles.secondaryButtonText}>Replace File</Text>
+        {!isLocked ? (
+          <TouchableOpacity style={styles.addBtn} onPress={() => handleOpenSheet(null)}>
+            <Ionicons name="add" size={19} color={colors.primary} />
+            <Text style={styles.addBtnText}>Add Bill</Text>
           </TouchableOpacity>
-        )}
-      </Field>
+        ) : null}
 
-      {!isLocked && (
-        <View style={{ marginTop: 20 }}>
-          <View style={styles.footerRow}>
-            <TouchableOpacity style={[styles.saveButton, styles.footerButton]} onPress={handleSaveDraft} disabled={saving}>
-              {saving ? <ActivityIndicator color={colors.text} /> : <Text style={styles.buttonText}>Save Draft</Text>}
-            </TouchableOpacity>
-            <TouchableOpacity style={[styles.submitButton, styles.footerButton]} onPress={handleSubmit} disabled={saving}>
-              {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitButtonText}>Submit Claim</Text>}
-            </TouchableOpacity>
+        {items.length > 0 ? (
+          <View style={styles.totalRow}>
+            <Text style={styles.totalLabel}>Total</Text>
+            <Text style={styles.totalValue}>${totalUsd.toFixed(2)} USD</Text>
           </View>
-          {expenseId && (
-            <TouchableOpacity style={styles.deleteButton} onPress={handleDelete} disabled={saving}>
-              <Text style={styles.deleteButtonText}>Delete Expense</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-      )}
+        ) : null}
 
-      <Modal visible={!!previewImageUri} transparent animationType="fade">
-        <View style={styles.previewOverlay}>
-          <TouchableOpacity
-            style={styles.previewCloseButton}
-            onPress={() => setPreviewImageUri(null)}
-          >
-            <Text style={styles.previewCloseText}>Close</Text>
+        {missingReceipts > 0 && !isLocked ? (
+          <Text style={styles.warn}>
+            {missingReceipts === 1
+              ? '1 bill has no receipt. Attach one before submitting.'
+              : `${missingReceipts} bills have no receipt. Attach one to each before submitting.`}
+          </Text>
+        ) : null}
+
+        {expenseId && !isLocked ? (
+          <TouchableOpacity style={styles.deleteClaim} onPress={handleDeleteClaim}>
+            <Text style={styles.deleteClaimText}>Delete this claim</Text>
           </TouchableOpacity>
-          {previewImageUri && (
-            <Image source={{ uri: previewImageUri }} style={styles.previewImage} resizeMode="contain" />
-          )}
-        </View>
-      </Modal>
-    </ScrollView>
-  );
-}
+        ) : null}
+      </ScrollView>
 
-// Defined at module scope (not inside AddEditExpenseScreen) and taking
-// `styles` as an explicit prop — a component defined INSIDE another
-// component's function body gets recreated as a brand-new function on
-// every render, which makes React treat it as a different component type
-// and remount its children every time. Since Field wraps the TextInputs,
-// that remount was dropping keyboard focus after every single keystroke —
-// exactly the "keyboard disappears after typing one character" bug.
-function Field({ label, children, styles }) {
-  return (
-    <View style={styles.field}>
-      <Text style={styles.label}>{label}</Text>
-      {children}
+      {!isLocked ? (
+        <View style={styles.footer}>
+          <TouchableOpacity
+            style={[styles.footerBtn, styles.secondary]}
+            onPress={handleSaveHeader}
+            disabled={saving}
+          >
+            <Text style={styles.secondaryText}>{saving ? 'Saving…' : 'Save Draft'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.footerBtn, styles.primary, !canSubmit ? styles.disabled : null]}
+            onPress={handleSubmit}
+            disabled={saving || !canSubmit}
+          >
+            <Text style={styles.primaryText}>Submit</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+
+      <BillSheet
+        visible={sheetOpen}
+        empId={empId}
+        bill={editingBill}
+        currencies={currencies}
+        saving={billSaving}
+        onSave={handleSaveBill}
+        onClose={() => {
+          setSheetOpen(false);
+          setEditingBill(null);
+        }}
+      />
     </View>
   );
 }
 
 function createStyles(colors) {
   return StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.bg },
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.bg },
-  error: { color: colors.red, marginBottom: 12, fontWeight: '600' },
-  row2: { flexDirection: 'row', gap: 12 },
-  halfField: { flex: 1 },
-  field: { marginBottom: 14 },
-  amountRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-start' },
-  conversionNote: { marginTop: 6, fontSize: 12, color: colors.textMuted },
-  conversionUsd: { fontWeight: '800', color: colors.text },
-  conversionError: { marginTop: 6, fontSize: 12, color: '#c0392b' },
-  conversionWarn: { marginTop: 3, fontSize: 11, color: '#b26a00' },
-  label: { fontSize: 11, color: colors.textMuted, marginBottom: 6, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.3 },
-  input: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.sm,
-    padding: 12,
-    fontSize: 15,
-    fontWeight: '600',
-    color: colors.text,
-    backgroundColor: colors.surface,
-  },
-  inputLocked: { backgroundColor: colors.bg, color: colors.textMuted },
-  helperText: { fontSize: 12, color: colors.textMuted, marginBottom: 6 },
-  progressCard: {
-    backgroundColor: colors.primaryTint,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.sm,
-    padding: 12,
-    marginBottom: 14,
-  },
-  progressTitle: { color: colors.primary, fontWeight: '800', fontSize: 13.5, marginBottom: 4 },
-  progressLine: { color: colors.text, fontSize: 12.5, marginTop: 2 },
-  lockedBanner: {
-    backgroundColor: colors.amberTint,
-    borderWidth: 1,
-    borderColor: '#fde68a',
-    borderRadius: radius.sm,
-    padding: 12,
-    marginBottom: 16,
-  },
-  lockedText: { color: '#92400e', fontWeight: '600', fontSize: 12.5 },
-  dropzone: {
-    borderWidth: 1.5,
-    borderStyle: 'dashed',
-    borderColor: colors.borderStrong,
-    borderRadius: radius.md,
-    paddingVertical: 20,
-    alignItems: 'center',
-    backgroundColor: colors.surface,
-    marginBottom: 8,
-  },
-  dropzoneText: { fontSize: 12.5, fontWeight: '700', color: colors.text, marginTop: 6 },
-  dropzoneHint: { fontSize: 10.5, color: colors.textFaint, marginTop: 2 },
-  attachedRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.sm,
-    padding: 12,
-    marginBottom: 8,
-  },
-  fileBadge: {
-    width: 38,
-    height: 38,
-    borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  fileBadgeText: { fontSize: 9.5, fontWeight: '800' },
-  attachmentName: { fontSize: 13.5, color: colors.text, fontWeight: '700' },
-  attachmentSub: { fontSize: 11, color: colors.textFaint, marginTop: 1 },
-  viewLink: { color: colors.primary, fontWeight: '700', fontSize: 13 },
-  secondaryButton: {
-    borderWidth: 1,
-    borderColor: colors.primary,
-    borderRadius: radius.sm,
-    padding: 11,
-    alignItems: 'center',
-    backgroundColor: colors.primaryTint,
-  },
-  secondaryButtonText: { color: colors.primary, fontWeight: '700', fontSize: 13 },
-  footerRow: { flexDirection: 'row', gap: 12, marginBottom: 10 },
-  footerButton: { flex: 1, marginBottom: 0 },
-  saveButton: {
-    backgroundColor: colors.surface,
-    borderWidth: 1.5,
-    borderColor: colors.border,
-    borderRadius: radius.sm,
-    padding: 14,
-    alignItems: 'center',
-  },
-  submitButton: {
-    backgroundColor: colors.primary,
-    borderRadius: radius.sm,
-    padding: 14,
-    alignItems: 'center',
-    ...shadow.card,
-  },
-  buttonText: { color: colors.text, fontSize: 15, fontWeight: '700' },
-  submitButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  deleteButton: {
-    marginTop: 10,
-    backgroundColor: colors.redTint,
-    borderRadius: radius.sm,
-    padding: 14,
-    alignItems: 'center',
-  },
-  deleteButtonText: { color: colors.red, fontSize: 15, fontWeight: '700' },
-  previewOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(15,23,42,0.94)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  previewImage: { width: '100%', height: '80%' },
-  previewCloseButton: {
-    position: 'absolute',
-    top: 50,
-    right: 20,
-    backgroundColor: 'rgba(255,255,255,0.15)',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-    zIndex: 1,
-  },
-  previewCloseText: { color: '#fff', fontWeight: '600' },
+    container: { flex: 1, backgroundColor: colors.bg },
+    centre: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.bg },
+    sectionLabel: {
+      fontSize: 11,
+      fontWeight: '800',
+      color: colors.textFaint,
+      textTransform: 'uppercase',
+      letterSpacing: 0.4,
+      marginBottom: 8,
+      marginTop: 4,
+    },
+    statusRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 12 },
+    statusText: { fontSize: 13, fontWeight: '700', color: colors.primary },
+    lockedNote: { fontSize: 12, color: colors.textMuted },
+    card: {
+      backgroundColor: colors.surface,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: radius.md,
+      padding: 14,
+      marginBottom: 20,
+      ...shadow.card,
+    },
+    label: { fontSize: 12, fontWeight: '700', color: colors.textMuted, marginBottom: 6, marginTop: 10 },
+    input: {
+      backgroundColor: colors.bg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: radius.sm,
+      paddingHorizontal: 12,
+      paddingVertical: 11,
+      fontSize: 15,
+      color: colors.text,
+    },
+    readonlyRow: { flexDirection: 'row', gap: 12, marginTop: 16 },
+    readonlyLabel: { fontSize: 11, color: colors.textFaint, fontWeight: '700' },
+    readonlyValue: { fontSize: 13, color: colors.text, marginTop: 3 },
+    billsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+    billCount: { fontSize: 11.5, color: colors.textFaint, fontWeight: '700' },
+    empty: {
+      alignItems: 'center',
+      padding: 26,
+      backgroundColor: colors.surface,
+      borderRadius: radius.md,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderStyle: 'dashed',
+    },
+    emptyText: { fontSize: 14, fontWeight: '700', color: colors.text, marginTop: 8 },
+    emptyHint: { fontSize: 12, color: colors.textFaint, marginTop: 3 },
+    billRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      backgroundColor: colors.surface,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: radius.md,
+      padding: 12,
+      marginBottom: 8,
+    },
+    billNo: {
+      width: 24,
+      height: 24,
+      borderRadius: 8,
+      backgroundColor: colors.primaryTint,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    billNoText: { fontSize: 11.5, fontWeight: '800', color: colors.primary },
+    billType: { fontSize: 14, fontWeight: '700', color: colors.text },
+    billMeta: { fontSize: 11.5, color: colors.textMuted, marginTop: 2 },
+    billTags: { flexDirection: 'row', gap: 6, marginTop: 6 },
+    tag: {
+      paddingHorizontal: 7,
+      paddingVertical: 2,
+      borderRadius: 999,
+      backgroundColor: colors.primaryTint,
+    },
+    tagText: { fontSize: 9.5, fontWeight: '800', color: colors.primary },
+    tagMissing: { backgroundColor: colors.amberTint },
+    tagMissingText: { color: colors.status.REVISION_REQUESTED.text },
+    billAmounts: { alignItems: 'flex-end' },
+    billAmount: { fontSize: 13.5, fontWeight: '700', color: colors.text },
+    billUsd: { fontSize: 11.5, color: colors.textMuted, marginTop: 2 },
+    removeBtn: { paddingLeft: 4 },
+    addBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 6,
+      borderWidth: 1,
+      borderStyle: 'dashed',
+      borderColor: colors.primary,
+      borderRadius: radius.md,
+      paddingVertical: 13,
+      marginTop: 4,
+    },
+    addBtnText: { color: colors.primary, fontWeight: '700', fontSize: 14 },
+    totalRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginTop: 18,
+      paddingTop: 14,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+    },
+    totalLabel: { fontSize: 13, fontWeight: '700', color: colors.textMuted },
+    totalValue: { fontSize: 18, fontWeight: '800', color: colors.text },
+    warn: {
+      marginTop: 12,
+      fontSize: 12.5,
+      color: colors.status.REVISION_REQUESTED.text,
+      backgroundColor: colors.amberTint,
+      borderRadius: radius.sm,
+      padding: 10,
+    },
+    error: {
+      color: colors.red,
+      backgroundColor: colors.redTint,
+      borderRadius: radius.sm,
+      padding: 11,
+      fontSize: 13,
+      marginBottom: 12,
+    },
+    deleteClaim: { marginTop: 26, alignItems: 'center', padding: 12 },
+    deleteClaimText: { color: colors.red, fontSize: 13.5, fontWeight: '600' },
+    footer: {
+      flexDirection: 'row',
+      gap: 10,
+      padding: 12,
+      paddingBottom: 26,
+      backgroundColor: colors.surface,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+    },
+    footerBtn: { flex: 1, borderRadius: radius.sm, paddingVertical: 14, alignItems: 'center' },
+    secondary: { backgroundColor: colors.bg, borderWidth: 1, borderColor: colors.borderStrong },
+    secondaryText: { color: colors.text, fontWeight: '700', fontSize: 15 },
+    primary: { backgroundColor: colors.primary },
+    primaryText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+    disabled: { opacity: 0.45 },
   });
 }
