@@ -436,6 +436,39 @@ response shapes.
 **Build machine:** Node.js and npm; `npx expo` (Expo SDK 54); EAS CLI only
 for native binaries.
 
+> ### Read this before running anything
+>
+> | | Host | Base path | **Schema** |
+> |---|---|---|---|
+> | **prod** | `karyasiddhi.trinamix.com` | `/ords/repo` | **`REPO`** |
+> | **dev** | `karyasiddhi`**`test`**`.trinamix.com` | `/ords/repo` | **`HRMS`** |
+>
+> **The base path is `repo` on BOTH — but on dev it is served by the `HRMS`
+> schema.** The URL says `repo` and the schema is `HRMS`. There is no way to
+> infer one from the other.
+>
+> Two consequences, both of which have already cost real time:
+>
+> 1. **"Run this on REPO" means production.** Dev work goes to `HRMS`. Saying
+>    "REPO" when you mean "the dev database" sends the script to live data.
+>
+> 2. **A `/ords/repo` URL does not tell you the environment.** Only the
+>    hostname does, and the difference is four letters in the middle of it.
+>
+> Check where you are before every script:
+>
+> ```sql
+> SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS schema,   -- HRMS = dev, REPO = prod
+>        SYS_CONTEXT('USERENV','DB_NAME')        AS db
+> FROM   dual;
+> ```
+>
+> Most scripts in `db/` open with a guard that prints the schema and refuses to
+> run where prerequisites are missing. That guard exists because of this.
+>
+> Rename the connections in your SQL tool to `DEV-hrms` and `PROD-repo` if you
+> can. It is the cheapest possible fix for the most expensive kind of mistake.
+
 **Collect these before starting.** Several are not discoverable later
 without guessing, and a wrong value fails as something else entirely.
 
@@ -1279,7 +1312,10 @@ none of the error messages point at it.
 | Symptom | Cause |
 |---|---|
 | **403, no JSON body**, "Access to the resource is prohibited" | a PL/SQL object the handler references is INVALID or missing. ORDS refuses the resource before running it. **Not** a permissions problem despite the wording. Check `user_objects` for `INVALID` |
-| **555** (ORDS-25001) | same class: handler PL/SQL failed to compile or run. Usually a missing column or object |
+| **555** (ORDS-25001) | same class: handler PL/SQL failed to compile or run. Usually a missing column or object — **but check the template exists at all first**: a re-run of `ORDS.DEFINE_MODULE` wipes every template in the module, and a missing template gives the same 555. `72_restore_currency_endpoints.sql` §4b lists all 21 endpoints and flags the missing ones |
+| **A dropdown showing only its default value** | the endpoint behind it is failing and the app is falling back. Check the endpoint before touching the data — dev's rate table had all 12 currencies while the `currencies` template did not exist |
+| **ORA-01843 "not a valid month" reaching the user** | a date sent in the format the *other* half of the API uses. **Writes take ISO (`YYYY-MM-DD`), reads return `MM/DD/YYYY`** — `client.js` bridges it with `isoFromMDY`/`mdyFromISO`, so every new call site has to know which side it is on. Fixed for `exchange-rate` by `75_exchange_rate_date_parse_fix.sql`, which accepts both. Check any handler that parses a date parameter with a single format |
+| **"Could not read on_date" for a date that is obviously valid** | `DEFAULT NULL ON CONVERSION ERROR` written on `TO_DATE`'s **format** argument instead of its **value** argument. It compiles and returns NULL for every input. Correct form: `TO_DATE(expr DEFAULT NULL ON CONVERSION ERROR, 'YYYY-MM-DD')`. `75_...sql` §3 has a query that flags the broken construct anywhere in the module |
 | **570** | same class. Also seen when the ORDS connection-pool user is locked |
 | **401 "The request is unauthenticated"** | the `Authorization` header parameter is missing from the handler, or a privilege pattern matches the login URL |
 | **Full HTML "Unauthorized — please sign in" page** | a privilege pattern (usually a wildcard) covers an endpoint that must stay open |
@@ -1291,6 +1327,7 @@ none of the error messages point at it.
 | **403 "not linked to an active employee record"** | genuine: no `ACTIVE`/`RESIGNED` `employeedetails` row matches that `company_email` |
 | **404 on a URL that exists** | template registered with no handler attached. `51_restore_missing_handlers.sql` fixes the two known cases |
 | **Accept/revise/reject fails with a bare 403 or 555** | `PROCESS_EXPENSE_ACTION` is INVALID — usually the `COMMENT`/`COMMENTS` mismatch, [§13.6](#136-the-approvals-comment-column) |
+| **403 on Home AND Approvals at once**, right after a schema change | the handlers still SELECT a column that was dropped — `ORA-00904` at runtime, which ORDS reports as a bodiless 403. Fix: `70_email_multibill.sql` then `71_handlers_drop_legacy_columns.sql`. **Read the handler's own `source` from `user_ords_handlers` and check every column in it against `user_tab_columns`.** Running a cut-down version of the query proves nothing — it only tests the columns you remembered to include |
 | **401 an hour into a session** | access token expired (3600s). Log in again |
 | **Amounts ~88× too large** | conversion direction inverted — [§6.2](#62-currency-conversion) |
 | **Blank web page, 404 on every bundle** | missing `.nojekyll`, or `baseUrl` not matching the sub-path |

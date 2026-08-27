@@ -42,11 +42,50 @@ import { radius } from '../theme';
 import PickerField from './PickerField';
 import DateField from './DateField';
 import { EXPENSE_TYPES } from '../constants/expenseTypes';
-import { getExchangeRate, isoFromMDY } from '../api/client';
+import {
+  getExchangeRate,
+  isoFromMDY,
+  mdyFromISO,
+  scanReceipt,
+  recordScanOutcome,
+} from '../api/client';
 import { showAlert } from '../utils/alert';
 
+// Only these can be scanned. The stored-receipt list is wider on purpose -- a
+// spreadsheet or a .rar is a legitimate thing to keep on file and nothing a
+// vision model can read, and offering to scan one would only produce a
+// confident answer about nothing. Mirrors the server's own check in db/79.
+const SCANNABLE = ['pdf', 'jpg', 'jpeg', 'png', 'webp', 'heic'];
+
+// The fields the scan may fill, in the order they appear in the form, so the
+// review sheet reads top-to-bottom like the thing it is about to change.
+const SCAN_FIELDS = [
+  { key: 'bill_no',     label: 'Bill No' },
+  { key: 'bill_date',   label: 'Bill Date' },
+  { key: 'type',        label: 'Type' },
+  { key: 'description', label: 'Description' },
+  // Added in prompt v2 (db/79d). An Airtel wifi bill prints a statement period,
+  // and that is what these two mean -- before v2 the schema had no such field,
+  // so a month of internet was filled in as a one-day expense.
+  { key: 'from_date',   label: 'From Date' },
+  { key: 'to_date',     label: 'To Date' },
+  { key: 'currency',    label: 'Currency' },
+  { key: 'amount',      label: 'Expense Amount' },
+];
+
 const ALLOWED_EXTENSIONS = ['pdf', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'csv', 'rar'];
-const MAX_BYTES = 1 * 1024 * 1024; // 1 MB — matches the handler's c_max_bytes
+// TWO DIFFERENT CEILINGS, and conflating them is what stopped the scan button
+// appearing at all.
+//
+//   ATTACH: 1 MB. What the receipt endpoint will STORE (c_max_bytes in db/65).
+//   SCAN:   6 MB. What the scan endpoint will READ (db/79). Nothing is kept, so
+//           the limit is about request size, not storage.
+//
+// A phone camera produces 3-5 MB. Rejecting those at pick time meant `picked`
+// was never set, so there was nothing to offer a scan for -- the feature was
+// unreachable for exactly the files it exists to handle.
+const MAX_BYTES = 1 * 1024 * 1024;      // attach
+const MAX_SCAN_BYTES = 6 * 1024 * 1024; // scan
 
 const EMPTY = {
   bill_no: '',
@@ -78,6 +117,15 @@ export default function BillSheet({
   const [rateLoading, setRateLoading] = useState(false);
   const [error, setError] = useState(null);
 
+  // ---- AI receipt scan ----
+  const [scanning, setScanning] = useState(false);
+  const [scan, setScan] = useState(null);        // { scan_id, fields } awaiting review
+  // What was applied, and what it was applied as. Compared at save time so we
+  // can tell APPLIED from EDITED -- the difference between "this saved me
+  // typing" and "this was close but wrong", which is the only number that says
+  // whether the feature earns its keep.
+  const [applied, setApplied] = useState(null);  // { scan_id, values }
+
   const isEdit = !!(bill && bill.id);
 
   // Reset every time the sheet opens, so a cancelled edit never bleeds into
@@ -88,6 +136,9 @@ export default function BillSheet({
     setPicked(null);
     setRate(null);
     setRateError(null);
+    setScan(null);
+    setApplied(null);
+    setScanning(false);
     if (bill) {
       setF({
         bill_no: bill.bill_no || '',
@@ -159,16 +210,131 @@ export default function BillSheet({
         showAlert('File type not allowed', `Use one of: ${ALLOWED_EXTENSIONS.join(', ')}.`);
         return;
       }
-      // Checked here as well as server-side so the person finds out before
-      // waiting for a 1 MB upload to be rejected.
-      if (file.size && file.size > MAX_BYTES) {
-        showAlert('File too large', 'Receipts must be 1 MB or smaller.');
+      // A big photo is still worth accepting if it can be SCANNED: the fields
+      // are the valuable part, and the receipt itself is only required at
+      // submit, not at save. So the ceiling here is the scan limit for images
+      // and the attach limit for everything else.
+      const scannable = SCANNABLE.includes(ext);
+      const ceiling = scannable ? MAX_SCAN_BYTES : MAX_BYTES;
+      if (file.size && file.size > ceiling) {
+        showAlert(
+          'File too large',
+          scannable
+            ? 'Photos must be 6 MB or smaller. Take it again at a lower resolution.'
+            : 'Receipts must be 1 MB or smaller.'
+        );
         return;
       }
       setPicked(file);
     } catch (e) {
       showAlert('Could not open the file picker', e.message || 'Please try again.');
     }
+  }
+
+  // ---- AI scan ----
+  //
+  // Explicit button rather than firing on pick. Scanning costs money per call
+  // and someone attaching a file they have already typed up should not pay for
+  // a read nobody asked for. It also means the person can scan twice if the
+  // first photo was bad.
+  const canScan = useMemo(() => {
+    if (!picked) return false;
+    const ext = String(picked.name || '').split('.').pop().toLowerCase();
+    return SCANNABLE.includes(ext);
+  }, [picked]);
+
+  // Over the ATTACH limit but within the SCAN limit. Scannable, not storable.
+  // The bill can still be saved -- a receipt is only required to SUBMIT -- so
+  // this is a warning, not an error.
+  const tooBigToAttach = !!(picked && picked.size && picked.size > MAX_BYTES);
+
+  async function handleScan() {
+    if (!picked) return;
+    setScanning(true);
+    setError(null);
+    try {
+      const res = await scanReceipt(empId, picked);
+      // The endpoint answers 200 for an unreadable photo too -- the request was
+      // fine, the image was not. So the error lives in the body, not the status.
+      if (!res || res.error || !res.fields) {
+        showAlert(
+          'Could not read that receipt',
+          (res && res.error) ||
+            'Nothing legible came back. Fill the bill in by hand — the file is still attached.'
+        );
+        return;
+      }
+      setScan({ scan_id: res.scan_id, fields: res.fields });
+    } catch (e) {
+      showAlert('Could not read that receipt', e.message || 'Please fill the bill in by hand.');
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  // What the scan proposes, filtered to what this form can actually accept.
+  //
+  // A type or currency the model invents is dropped rather than shown: offering
+  // to apply a value the picker cannot hold would put the form in a state the
+  // person could not then save, and they would have no idea why.
+  const proposals = useMemo(() => {
+    if (!scan || !scan.fields) return [];
+    const s = scan.fields;
+    const allowedTypes = EXPENSE_TYPES.map((t) => t.id);
+    const allowedCur = (currencies && currencies.length ? currencies : [{ currency: 'INR' }])
+      .map((c) => c.currency);
+
+    return SCAN_FIELDS.map(({ key, label }) => {
+      let value = s[key];
+      let dropped = null;
+
+      if ((key === 'bill_date' || key === 'from_date' || key === 'to_date') && value) {
+        value = mdyFromISO(value);
+      }
+      if (key === 'amount' && value != null) value = String(value);
+      if (key === 'type' && value && !allowedTypes.includes(value)) {
+        dropped = value; value = null;
+      }
+      if (key === 'currency' && value && !allowedCur.includes(value)) {
+        dropped = value; value = null;
+      }
+
+      return {
+        key,
+        label,
+        value: value === '' ? null : value,
+        dropped,
+        replaces: f[key] && value && String(f[key]) !== String(value) ? f[key] : null,
+      };
+    });
+  }, [scan, currencies, f]);
+
+  function applyScan() {
+    const next = { ...f };
+    const values = {};
+    proposals.forEach((p) => {
+      if (p.value == null) return;
+      next[p.key] = p.value;
+      values[p.key] = p.value;
+    });
+
+    // Fall back to the bill date ONLY where the scan gave nothing. Since prompt
+    // v2 a null here means "this document states no period", which is the true
+    // answer for a taxi fare or a meal -- so the same-day default is right for
+    // those and no longer overrides a period the document actually printed.
+    if (next.bill_date) {
+      if (!next.from_date) next.from_date = next.bill_date;
+      if (!next.to_date) next.to_date = next.bill_date;
+    }
+
+    setF(next);
+    setApplied({ scan_id: scan.scan_id, values });
+    setScan(null);
+  }
+
+  function discardScan() {
+    recordScanOutcome(empId, scan.scan_id, 'DISCARDED');
+    setScan(null);
   }
 
   function validate() {
@@ -201,6 +367,17 @@ export default function BillSheet({
       return;
     }
     setError(null);
+
+    // Was the scan any use? Answered here rather than at apply time, because
+    // "applied then corrected" only becomes visible once the person stops
+    // typing. Fire and forget -- recordScanOutcome swallows everything.
+    if (applied) {
+      const changed = Object.keys(applied.values).some(
+        (k) => String(f[k] ?? '') !== String(applied.values[k] ?? '')
+      );
+      recordScanOutcome(empId, applied.scan_id, changed ? 'EDITED' : 'APPLIED');
+    }
+
     // ISO out — the item endpoints expect it. exchange_rate and amount_usd are
     // deliberately NOT sent; the server derives them.
     await onSave(
@@ -214,7 +391,10 @@ export default function BillSheet({
         currency: f.currency,
         amount: Number(f.amount),
       },
-      picked
+      // Only pass the file if it is small enough to STORE. A 4 MB photo has
+      // already done its job by then -- it filled the form -- and sending it
+      // would earn a 400 from the receipt endpoint and lose the typing with it.
+      tooBigToAttach ? null : picked
     );
   }
 
@@ -356,15 +536,150 @@ export default function BillSheet({
               {receiptLabel || 'Choose a file (pdf, jpg, png, xlsx, xls, csv, rar)'}
             </Text>
           </TouchableOpacity>
-          {picked ? (
+          {picked && !tooBigToAttach ? (
             <Text style={styles.hint}>Uploads when you save this bill.</Text>
-          ) : (
+          ) : null}
+
+          {/* Scannable but not storable. Worth spelling out rather than failing
+              at save: the photo can still fill the form, and a receipt is only
+              required to SUBMIT, so saving now loses nothing but the file. */}
+          {tooBigToAttach ? (
+            <Text style={styles.appliedNote}>
+              This photo is {(picked.size / (1024 * 1024)).toFixed(1)} MB — over the
+              1 MB attachment limit, so it will not be attached. You can still read
+              the fields off it below, then attach a smaller photo before submitting.
+            </Text>
+          ) : null}
+
+          {!picked ? (
             <Text style={styles.hint}>
               Optional now — required on every bill before you can submit the claim.
             </Text>
-          )}
+          ) : null}
+
+          {/* Picked, but nothing a vision model can read. Said out loud, because
+              a button that simply is not there looks the same as one that is
+              broken -- which is exactly how this came up. */}
+          {picked && !canScan ? (
+            <Text style={styles.hint}>
+              This file can be attached but not read automatically — scanning works
+              on photos and PDFs ({SCANNABLE.join(', ')}).
+            </Text>
+          ) : null}
+
+          {/* Offered only for a photo or PDF, and only once one is picked.
+              Deliberately a button and not automatic: a scan costs a paid API
+              call, and someone attaching a file to a bill they have already
+              filled in should not pay for a read they did not ask for. */}
+          {canScan ? (
+            <TouchableOpacity
+              style={styles.scanBtn}
+              onPress={handleScan}
+              disabled={scanning || saving}
+            >
+              {scanning ? (
+                <ActivityIndicator color={colors.primary} />
+              ) : (
+                <Ionicons name="sparkles-outline" size={18} color={colors.primary} />
+              )}
+              <Text style={styles.scanText}>
+                {scanning ? 'Reading the receipt…' : 'Fill the form from this receipt'}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
+          {canScan && !scanning ? (
+            <Text style={styles.hint}>
+              Reads the photo and suggests the fields. You see everything it read
+              before any of it goes in.
+            </Text>
+          ) : null}
+
+          {applied ? (
+            <Text style={styles.appliedNote}>
+              Some fields were filled from the receipt. Check them — especially the
+              amount — before saving.
+            </Text>
+          ) : null}
         </ScrollView>
       </View>
+
+      {/* ---- review sheet ---- */}
+      {/*
+          Nothing reaches the form until Apply. That was a deliberate choice
+          while accuracy is unproven: the model is small, and a plausible wrong
+          total that nobody notices is far worse than six fields typed by hand.
+      */}
+      <Modal visible={!!scan} animationType="slide" transparent onRequestClose={discardScan}>
+        <View style={styles.reviewBackdrop}>
+          <View style={styles.reviewCard}>
+            <Text style={styles.reviewTitle}>What the receipt says</Text>
+            <Text style={styles.reviewSub}>
+              Read from your photo. Nothing has changed in the form yet.
+            </Text>
+
+            <ScrollView style={{ maxHeight: 340 }}>
+              {proposals.map((p) => (
+                <View key={p.key} style={styles.reviewRow}>
+                  <Text style={styles.reviewLabel}>{p.label}</Text>
+                  {p.value != null ? (
+                    <Text style={styles.reviewValue}>{p.value}</Text>
+                  ) : (
+                    <Text style={styles.reviewEmpty}>
+                      {/* A null is the model saying it could not read this, which
+                          is the answer we asked it for. Saying so is better than
+                          a blank line the person has to interpret. */}
+                      couldn’t read this
+                    </Text>
+                  )}
+                  {p.replaces ? (
+                    <Text style={styles.reviewReplaces}>replaces “{p.replaces}”</Text>
+                  ) : null}
+                  {p.dropped ? (
+                    <Text style={styles.reviewReplaces}>
+                      read “{p.dropped}”, which is not one of the allowed values — ignored
+                    </Text>
+                  ) : null}
+                </View>
+              ))}
+
+              {/* Said before Apply, not discovered after it. */}
+              {scan && scan.fields && !scan.fields.from_date && !scan.fields.to_date ? (
+                <Text style={styles.reviewFoot}>
+                  No billing period printed on this document, so From and To Date
+                  will both be set to the bill date.
+                </Text>
+              ) : null}
+
+              {scan && scan.fields && scan.fields.vendor ? (
+                <View style={styles.reviewRow}>
+                  <Text style={styles.reviewLabel}>Vendor</Text>
+                  <Text style={styles.reviewValue}>{scan.fields.vendor}</Text>
+                  <Text style={styles.reviewReplaces}>
+                    not a field on the bill — shown so you can tell this is the right receipt
+                  </Text>
+                </View>
+              ) : null}
+
+              {scan && scan.fields && scan.fields.unreadable ? (
+                <Text style={styles.reviewWarn}>{scan.fields.unreadable}</Text>
+              ) : null}
+            </ScrollView>
+
+            <View style={styles.reviewActions}>
+              <TouchableOpacity onPress={discardScan} style={styles.reviewCancel}>
+                <Text style={styles.reviewCancelText}>Discard</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={applyScan} style={styles.reviewApply}>
+                <Text style={styles.reviewApplyText}>Apply</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.reviewFoot}>
+              The conversion rate and USD amount are always worked out by the
+              server, never by the AI.
+            </Text>
+          </View>
+        </View>
+      </Modal>
     </Modal>
   );
 }
@@ -446,5 +761,81 @@ function createStyles(colors) {
       fontSize: 13,
       marginTop: 10,
     },
+
+    // ---- AI scan ----
+    scanBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      marginTop: 12,
+      borderWidth: 1,
+      borderColor: colors.primary,
+      borderRadius: radius.sm,
+      padding: 13,
+      backgroundColor: colors.surface,
+    },
+    scanText: { flex: 1, fontSize: 13.5, color: colors.primary, fontWeight: '700' },
+    appliedNote: {
+      fontSize: 11.5,
+      lineHeight: 17,
+      color: colors.amber,
+      backgroundColor: colors.amberTint,
+      borderRadius: radius.sm,
+      paddingVertical: 7,
+      paddingHorizontal: 10,
+      marginTop: 12,
+    },
+
+    reviewBackdrop: {
+      flex: 1,
+      backgroundColor: 'rgba(0,0,0,0.45)',
+      justifyContent: 'flex-end',
+    },
+    reviewCard: {
+      backgroundColor: colors.bg,
+      borderTopLeftRadius: radius.lg,
+      borderTopRightRadius: radius.lg,
+      padding: 18,
+      paddingBottom: Platform.OS === 'ios' ? 34 : 18,
+    },
+    reviewTitle: { fontSize: 16, fontWeight: '800', color: colors.text },
+    reviewSub: { fontSize: 12, color: colors.textMuted, marginTop: 4, marginBottom: 12 },
+    reviewRow: {
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      paddingVertical: 9,
+    },
+    reviewLabel: { fontSize: 11, fontWeight: '700', color: colors.textMuted },
+    reviewValue: { fontSize: 15, color: colors.text, marginTop: 2 },
+    reviewEmpty: { fontSize: 14, color: colors.textFaint, marginTop: 2, fontStyle: 'italic' },
+    reviewReplaces: { fontSize: 11, color: colors.textFaint, marginTop: 3 },
+    reviewWarn: {
+      fontSize: 12,
+      lineHeight: 18,
+      color: colors.amber,
+      backgroundColor: colors.amberTint,
+      borderRadius: radius.sm,
+      padding: 10,
+      marginTop: 12,
+    },
+    reviewActions: { flexDirection: 'row', gap: 10, marginTop: 16 },
+    reviewCancel: {
+      flex: 1,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: radius.sm,
+      paddingVertical: 13,
+      alignItems: 'center',
+    },
+    reviewCancelText: { color: colors.textMuted, fontSize: 14, fontWeight: '600' },
+    reviewApply: {
+      flex: 1,
+      backgroundColor: colors.primary,
+      borderRadius: radius.sm,
+      paddingVertical: 13,
+      alignItems: 'center',
+    },
+    reviewApplyText: { color: '#fff', fontSize: 14, fontWeight: '700' },
+    reviewFoot: { fontSize: 11, color: colors.textFaint, marginTop: 10, textAlign: 'center' },
   });
 }

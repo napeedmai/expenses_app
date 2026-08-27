@@ -344,10 +344,15 @@ export async function submitExpense(empId, id) {
   return handle(res);
 }
 
-// Uploads a file the user picked (via expo-document-picker) to
-// POST /expenses/{id}/attachment as multipart/form-data.
-// `file` is expected to look like { uri, name, mimeType } — exactly what
-// expo-document-picker's result gives you.
+// DEAD CODE — DO NOT USE. Kept only until the next commit sweep.
+//
+// This is the CLAIM-level receipt upload, POST /expenses/{id}/attachment. That
+// endpoint no longer exists: a receipt belongs to a BILL now, and all four
+// columns this wrote (EXPENSES.ATTACHMENT_BLOB / _FILENAME / _MIME_TYPE /
+// _PATH) were dropped by db/64. db/73 removed the empty template.
+//
+// Use uploadItemAttachment() above. Note it does NOT use multipart — see the
+// comment there, and do not copy this function again.
 export async function uploadAttachment(empId, id, file) {
   const formData = new FormData();
 
@@ -467,42 +472,149 @@ export async function deleteItem(empId, expenseId, itemId) {
 // upload against the id it returns. That is what makes "attach the receipt
 // before saving" work from the user's point of view — the file is held in
 // screen state and posted the moment the bill exists.
+// THE BILL RECEIPT ENDPOINT TAKES THE RAW FILE AS THE REQUEST BODY.
+// Not multipart. This matters, and it cost a "400 Bad Request" to find out:
+//
+// The handler (db/65, POST :id/items/:item_id/attachment) does
+//
+//     l_blob := :body;
+//     l_mime := :content_type_hdr;
+//     IF is_allowed_attachment(l_mime) = 'N' THEN ... 400
+//
+// so Content-Type IS the file's MIME type and the body IS the bytes. Send
+// multipart and Content-Type becomes "multipart/form-data; boundary=..." --
+// which is not in the allow-list, so you get "File type not allowed" -- and
+// :body becomes the whole MIME envelope, boundaries and all, which would have
+// been stored into attachment_blob as a corrupt file if the check had passed.
+//
+// This function was originally copied from uploadAttachment() below, which was
+// multipart because the OLD claim-level endpoint parsed multipart. I wrote both
+// sides of this and never checked they agreed on the wire format.
 export async function uploadItemAttachment(empId, expenseId, itemId, file) {
-  const formData = new FormData();
+  const url = `${API_BASE_URL}/expenses/${expenseId}/items/${itemId}/attachment`;
+  const contentType = file.mimeType || 'application/octet-stream';
+  const headers = {
+    Authorization: `Bearer ${currentAccessToken || ''}`,
+    'X-Emp-Id': String(empId),
+    'X-Session-Token': currentSessionToken || '',
+    'X-File-Name': file.name,
+    'Content-Type': contentType,
+  };
 
-  if (Platform.OS === 'web') {
-    // See uploadAttachment above: browser FormData needs a real Blob, and
-    // silently serialises a {uri,name,type} object to "[object Object]".
-    const blob = file.file || (await (await fetch(file.uri)).blob());
-    formData.append('file', blob, file.name);
-  } else {
-    formData.append('file', {
-      uri: file.uri,
-      name: file.name,
-      type: file.mimeType || 'application/octet-stream',
+  if (Platform.OS !== 'web') {
+    // Native: FileSystem.uploadAsync streams the file straight from disk as the
+    // body. Reading it into a Blob first would work for small receipts but puts
+    // the whole file through JS memory for no reason, and RN's Blob support in
+    // fetch bodies has historically been patchy.
+    //
+    // '/legacy' is required — the SDK 53 FileSystem API dropped uploadAsync,
+    // and importing the non-legacy path throws at runtime. Same lesson as
+    // src/utils/openAttachment.js.
+    const FileSystem = await import('expo-file-system/legacy');
+    const res = await FileSystem.uploadAsync(url, file.uri, {
+      httpMethod: 'POST',
+      uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+      headers,
     });
+    // uploadAsync returns {status, body} — not a fetch Response — so handle()
+    // cannot be used on it.
+    let parsed = {};
+    try {
+      parsed = res.body ? JSON.parse(res.body) : {};
+    } catch (e) {
+      parsed = { error: res.body };
+    }
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(parsed.error || `Upload failed with status ${res.status}`);
+    }
+    return parsed;
   }
 
-  const res = await fetchWithTimeout(
-    `${API_BASE_URL}/expenses/${expenseId}/items/${itemId}/attachment`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${currentAccessToken || ''}`,
-        'X-Emp-Id': String(empId),
-        'X-Session-Token': currentSessionToken || '',
-        'X-File-Name': file.name,
-        // Content-Type is set by fetch/FormData with the right multipart
-        // boundary. Setting it by hand breaks the upload.
-      },
-      body: formData,
-    }
-  );
+  // Web: a Blob as the body sends exactly its bytes.
+  //
+  // file.file is the real File object expo-document-picker gives us in a
+  // browser; the blob: URI fetch is a fallback if a future version stops
+  // providing it.
+  const blob = file.file || (await (await fetch(file.uri)).blob());
+  const res = await fetchWithTimeout(url, { method: 'POST', headers, body: blob });
   return handle(res);
 }
 
 export function getItemAttachmentUrl(expenseId, itemId) {
   return `${API_BASE_URL}/expenses/${expenseId}/items/${itemId}/attachment`;
+}
+
+// ---- Reading a receipt with AI ----
+//
+// POST /expenses/scan-receipt — see db/79_ai_scan_receipt.sql.
+//
+// Same wire format as uploadItemAttachment: THE RAW FILE AS THE BODY, with
+// Content-Type set to the file's own MIME type. Not multipart.
+//
+// Returns { scan_id, fields: {...} } on a good read, or { scan_id, error } when
+// the model could not make sense of the image. Both come back as HTTP 200 —
+// deliberately. The request was fine; the photo was blurry. Treating that as a
+// failure would put an error in front of someone who just needs to type six
+// fields instead of checking six.
+//
+// NOT tied to a bill. The scan happens the moment a photo is picked, before any
+// row exists, so the suggestions can fill a blank form rather than correct a
+// saved one.
+//
+// Nothing is stored server-side except a log row. The image is read and dropped.
+export async function scanReceipt(empId, file) {
+  const url = `${API_BASE_URL}/expenses/scan-receipt`;
+  const contentType = file.mimeType || 'application/octet-stream';
+  const headers = {
+    Authorization: `Bearer ${currentAccessToken || ''}`,
+    'X-Emp-Id': String(empId),
+    'X-Session-Token': currentSessionToken || '',
+    'X-File-Name': file.name,
+    'Content-Type': contentType,
+  };
+
+  if (Platform.OS !== 'web') {
+    // '/legacy' — the SDK 53 FileSystem API dropped uploadAsync. Same reason as
+    // uploadItemAttachment above and src/utils/openAttachment.js.
+    const FileSystem = await import('expo-file-system/legacy');
+    const res = await FileSystem.uploadAsync(url, file.uri, {
+      httpMethod: 'POST',
+      uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+      headers,
+    });
+    try {
+      return res.body ? JSON.parse(res.body) : {};
+    } catch (e) {
+      return { error: 'Could not read that receipt. Please fill the bill in by hand.' };
+    }
+  }
+
+  const blob = file.file || (await (await fetch(file.uri)).blob());
+  // A longer timeout than the rest of the API: a vision call on a 4 MB photo
+  // takes seconds, not milliseconds, and the default would abort a scan that
+  // was about to succeed.
+  const res = await fetchWithTimeout(url, { method: 'POST', headers, body: blob }, 60000);
+  return handle(res);
+}
+
+// Records what the person did with a scan's suggestions: APPLIED, EDITED or
+// DISCARDED. See db/79c_scan_outcome.sql.
+//
+// FIRE AND FORGET. Every failure is swallowed. This exists so we can answer
+// "is this feature any use" from data rather than opinion — but a telemetry
+// call must never interrupt somebody doing their expenses, and it is not worth
+// one line of interface to report that it failed.
+export async function recordScanOutcome(empId, scanId, outcome) {
+  if (!scanId) return;
+  try {
+    await fetchWithTimeout(`${API_BASE_URL}/expenses/scan-outcome`, {
+      method: 'POST',
+      headers: { ...(await authHeaders(empId)), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scan_id: scanId, outcome }),
+    });
+  } catch (e) {
+    // Intentionally silent.
+  }
 }
 
 // The app shows and stores dates as MM/DD/YYYY (see src/components/DateField.js)

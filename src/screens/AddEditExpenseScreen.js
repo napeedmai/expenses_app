@@ -47,6 +47,7 @@ import {
   submitExpense,
   listMyProjects,
   listCurrencies,
+  whoami,
   listItems,
   addItem,
   updateItem,
@@ -98,12 +99,42 @@ export default function AddEditExpenseScreen({ route, navigation }) {
 
   const isLocked = !!expenseId && !EDITABLE_STATUSES.includes(status);
 
+  // ---- who will approve this ----
+  //
+  // my-projects now returns manager_empid and manager_name for each project
+  // (db/76), so the approver can be named the moment a project is chosen rather
+  // than after submitting. Derived, not stored in state: two copies of the same
+  // fact drift, and this one has no reason to.
+  const selectedProject = useMemo(
+    () =>
+      (myProjects || []).find((p) => String(p.project_id) === String(projectId)) || null,
+    [myProjects, projectId]
+  );
+
+  // A saved claim's stamped manager_name wins. Once submitted the approver is
+  // whoever was recorded then, even if the project's manager has changed since.
+  const projectManagerLabel =
+    managerName ||
+    (selectedProject ? selectedProject.manager_name || 'None assigned' : '—');
+
+  // Only a warning once a project is actually chosen — an empty header is not
+  // a problem, it is just unfinished.
+  const noProjectManager =
+    !managerName && !!selectedProject && !selectedProject.manager_name;
+
   // ---- loading ----
 
   useEffect(() => {
     listMyProjects(empId)
       .then((d) => setMyProjects(Array.isArray(d.items) ? d.items : []))
       .catch(() => setMyProjects([]));
+    // The finance approver is a constant (get_finance_manager_empid), so whoami
+    // carries it — see db/76. Fetched here so a NEW claim can name both
+    // approvers before it has been saved, instead of saying "Set when you
+    // submit" and making someone submit to find out who receives it.
+    whoami(empId)
+      .then((me) => setFinanceManagerName(me.finance_manager_name || null))
+      .catch(() => {});
     listCurrencies(empId)
       .then((d) => {
         const list = Array.isArray(d.items) ? d.items : [];
@@ -131,8 +162,11 @@ export default function AddEditExpenseScreen({ route, navigation }) {
         setCurrentStage(claim.current_stage || null);
         setProjectId(claim.project_id != null ? String(claim.project_id) : '');
         setClaimFor(claim.claim_for || '');
-        setManagerName(claim.manager_name || null);
-        setFinanceManagerName(claim.finance_manager_name || null);
+        // A SAVED claim's stamped values win over anything derived from the
+        // project list: once submitted, the approver is whoever was recorded at
+        // the time, even if the project's manager has changed since.
+        if (claim.manager_name) setManagerName(claim.manager_name);
+        if (claim.finance_manager_name) setFinanceManagerName(claim.finance_manager_name);
         await loadBills(initialExpenseId);
       } catch (e) {
         if (!cancelled) setError(e.message || 'Could not load this claim.');
@@ -350,23 +384,43 @@ export default function AddEditExpenseScreen({ route, navigation }) {
             placeholderTextColor={colors.textFaint}
           />
 
-          {/* Read-only. The reporting manager comes from the project, and the
-              finance manager from get_finance_manager_empid() — both resolved
-              server-side at submit. Shown so the person knows who will see it. */}
+          {/* Read-only, and named as early as we can know them.
+              PROJECT manager, not "reporting manager" — it is resolved by
+              get_project_manager_empid(project_id) from the PROJECT_MANAGER
+              table, which is often a different person from someone's HR
+              reporting line. The old label described the wrong thing.
+              Both are still stamped onto the claim server-side at submit; this
+              is a preview of who that will be, not a second source of truth. */}
           <View style={styles.readonlyRow}>
             <View style={{ flex: 1 }}>
-              <Text style={styles.readonlyLabel}>Reporting Manager</Text>
-              <Text style={styles.readonlyValue}>
-                {managerName || (expenseId ? 'Set when you submit' : '—')}
+              <Text style={styles.readonlyLabel}>Project Manager</Text>
+              <Text
+                style={[
+                  styles.readonlyValue,
+                  noProjectManager && { color: colors.amber },
+                ]}
+              >
+                {projectManagerLabel}
               </Text>
             </View>
             <View style={{ flex: 1 }}>
               <Text style={styles.readonlyLabel}>Manager (Finance)</Text>
               <Text style={styles.readonlyValue}>
-                {financeManagerName || (expenseId ? 'Set when you submit' : '—')}
+                {financeManagerName || '—'}
               </Text>
             </View>
           </View>
+
+          {/* Said here rather than at submit. A claim on a project with no
+              manager cannot be approved at the first stage, and finding that
+              out from an email after submitting is too late to act on. */}
+          {noProjectManager ? (
+            <Text style={styles.readonlyHint}>
+              This project has no manager assigned, so a claim on it cannot be
+              approved at the first stage. Ask for one to be set before you
+              submit.
+            </Text>
+          ) : null}
         </View>
 
         {/* ---- bills ---- */}
@@ -541,6 +595,16 @@ function createStyles(colors) {
     readonlyRow: { flexDirection: 'row', gap: 12, marginTop: 16 },
     readonlyLabel: { fontSize: 11, color: colors.textFaint, fontWeight: '700' },
     readonlyValue: { fontSize: 13, color: colors.text, marginTop: 3 },
+    readonlyHint: {
+      fontSize: 12,
+      lineHeight: 17,
+      color: colors.amber,
+      backgroundColor: colors.amberTint,
+      borderRadius: radius.sm,
+      paddingVertical: 7,
+      paddingHorizontal: 10,
+      marginTop: 8,
+    },
     billsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
     billCount: { fontSize: 11.5, color: colors.textFaint, fontWeight: '700' },
     empty: {

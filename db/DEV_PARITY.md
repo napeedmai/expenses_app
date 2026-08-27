@@ -1,14 +1,35 @@
 # Bringing dev (HRMS) level with prod (REPO)
 
-Dev has drifted a long way behind. Everything below is what it takes to make it
-a usable test environment — worth doing before real employees depend on prod,
-because right now REPO *is* the test environment.
+> **The environments, for the avoidance of doubt:**
+>
+> | | Host | Base path | Schema |
+> |---|---|---|---|
+> | prod | `karyasiddhi.trinamix.com` | `/ords/repo` | `REPO` |
+> | dev | `karyasiddhi`**`test`**`.trinamix.com` | `/ords/repo` | `HRMS` |
+>
+> The base path is `repo` on both. On dev it is served by the `HRMS` schema.
+> So a `/ords/repo` URL tells you nothing about which environment you are in --
+> only the hostname does, and only four letters differ.
+>
+> **The app's `src/config.js` points at the DEV host.** That is deliberate
+> while testing; it must be changed to `karyasiddhi.trinamix.com` before any
+> release build, because `API_BASE_URL` is compiled into the bundle.
+
+Dev has drifted behind. Everything below is what it takes to make it a usable
+test environment.
+
+**Much of it has since been done** — the multi-bill work (64-66, 68) and the
+email work are on HRMS already, which is why the multi-bill scripts ran there
+successfully. Treat the list below as a checklist to confirm rather than a
+sequence to run blindly, and use `HEALTH_CHECK.sql` to see what is actually
+missing.
 
 ---
 
 ## Where dev actually is
 
-Evidence gathered while debugging prod, all from dev returning errors:
+Evidence gathered from errors dev returned during this work. Several of these
+have since been fixed by running MASTER_DEPLOY and the later scripts there:
 
 | Missing / broken on HRMS | How we know |
 |---|---|
@@ -77,7 +98,37 @@ inside handler bodies.
 | 7 | `65_multibill_stage2_items.sql` | six bill endpoints + privileges |
 | 8 | `66_multibill_stage2_claims.sql` | claim header, submit rules |
 | 9 | `68_multibill_list_fields.sql` | `mine` and `pending` field additions |
-| 10 | `HEALTH_CHECK.sql` | **read-only** — should end with zero FAIL lines |
+| 10 | `70_email_multibill.sql` | **not optional** — see below |
+| 11 | `71_handlers_drop_legacy_columns.sql` | **not optional** — this is the 403 |
+| 12 | `HEALTH_CHECK.sql` | **read-only** — should end with zero FAIL lines |
+
+> **70 and 71 are the same bug in two places.** Script 64 dropped eight columns
+> from `EXPENSES`. Everything written afterwards was produced by copying the old
+> code and *adding* the new fields — adding, never removing. So six things went
+> on referencing columns that no longer exist:
+>
+> | | Referenced | Fixed by |
+> |---|---|---|
+> | `SEND_EXPENSE_MAIL` | `e.bill_no` | 70 |
+> | `GET /expenses/mine` | `bill_no, bill_date, type, description, attachment_filename` | 71 |
+> | `GET /expenses/pending` | same | 71 |
+> | `GET /expenses/:id` | same, plus all three `attachment_*` | 71 |
+> | `POST /expenses/draft` | `INSERT ... description` | 71 |
+> | `PUT /expenses/:id` | `UPDATE ... description` | 71 |
+>
+> Each is `ORA-00904` at runtime, which ORDS reports as **a bare 403 with no
+> body**. That is the 403 on Home and Approvals. Roles and privilege patterns
+> were correct the whole time; hours went into them anyway.
+>
+> `DEPLOYMENT.md` §12 already said a bodiless 403 means an invalid reference.
+> The check that finds it in one step is to read the **handler's own source**
+> and compare it against `user_tab_columns` — not to run a simplified version
+> of the query, which only proves the columns you remembered to include exist.
+>
+> **Prod needs both**, for the opposite reason: section 3 of script 64 never ran
+> there, so the columns survive, nothing 403s, and the faults are silent —
+> reviewers have been getting approval emails with a blank bill number and no
+> bill list at all.
 
 Then set the finance manager for dev, if it differs:
 
@@ -150,9 +201,8 @@ FROM   expense_mail_log ORDER BY id DESC FETCH FIRST 20 ROWS ONLY;
 
 ## Two things dev will not do
 
-**Push notifications.** They need the Firebase credentials attached to the
-build, and the app build points at one API at a time. Test push on prod, or
-accept that dev is email-only.
+**Push notifications.** The Firebase credentials are attached to the build, and
+a build points at one API at a time. Dev is realistically email-only.
 
 **Email, unless dev has its own SMTP.** `EMAIL_DEPLOY.sql` §4 reports whether
 `SMTP_HOST_ADDRESS` is set. If it is not, mail queues and never leaves, and
@@ -166,10 +216,10 @@ This is roughly half a day: ten scripts, a DBA for two of them, and a config
 switch — plus the DBA unlock, which is the actual blocker and outside your
 control.
 
-**Is it worth it?** Yes, but not urgently. Right now prod has no real data and
-no real users, so it is serving as the test environment perfectly well. The
-moment employees start filing claims that changes: you will want somewhere to
-break things that is not the system holding people's reimbursements.
+**Is it worth it?** It is largely done. The remaining gap is the locked
+`ORDS_PUBLIC_USER`, which is what stops dev serving requests at all, and that
+is a DBA task outside your control. Everything else can be confirmed with
+`HEALTH_CHECK.sql` in a few minutes.
 
 The sensible sequencing is to raise the DBA unlock now, since it has a queue
 time, and do the ten scripts while waiting for the Apple and Play accounts —

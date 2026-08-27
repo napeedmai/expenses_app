@@ -45,6 +45,50 @@ SET SERVEROUTPUT ON
 
 
 --------------------------------------------------------------------------------
+-- PART 0   --   THE GUARD. Do not remove.
+--
+-- This script is for a FIRST install on an empty schema. Part 3 calls
+-- ORDS.DEFINE_MODULE, and re-running that on an existing module DELETES EVERY
+-- TEMPLATE IN IT. The later parts then rebuild the handlers they know about --
+-- which is not all of them, and not the current versions of the ones that have
+-- been patched since.
+--
+-- On dev in August 2026 this emptied ten endpoints. It surfaced as a 403 on
+-- Home, a 555 on the conversion rate, and a project dropdown that stayed blank
+-- while its SQL returned a row -- three symptoms, none of which named the
+-- cause, and three separate rounds of diagnosis. Scripts 71, 72 and 73 exist
+-- to undo it.
+--
+-- So: if the module is already installed, stop. To upgrade an existing schema,
+-- run the individual numbered scripts instead -- they replace one handler at a
+-- time and are safe to repeat.
+--------------------------------------------------------------------------------
+DECLARE
+  l_handlers NUMBER;
+BEGIN
+  SELECT COUNT(h.id) INTO l_handlers
+  FROM   user_ords_modules m
+  LEFT   JOIN user_ords_templates t ON t.module_id = m.id
+  LEFT   JOIN user_ords_handlers  h ON h.template_id = t.id
+  WHERE  m.name = 'expenses.employee';
+
+  IF l_handlers > 0 THEN
+    RAISE_APPLICATION_ERROR(-20099,
+      'REFUSING TO RUN. The expenses.employee module already exists on '
+      || SYS_CONTEXT('USERENV','CURRENT_SCHEMA') || ' with ' || l_handlers
+      || ' handler(s). This script calls ORDS.DEFINE_MODULE, which would DELETE '
+      || 'every template in it -- including the multi-bill endpoints. Nothing '
+      || 'has changed. To upgrade, run the individual numbered scripts. To '
+      || 'genuinely start over, drop the module by hand first and know why.');
+  END IF;
+
+  DBMS_OUTPUT.PUT_LINE('No existing module on '
+    || SYS_CONTEXT('USERENV','CURRENT_SCHEMA') || '. Proceeding with a first install.');
+END;
+/
+
+
+--------------------------------------------------------------------------------
 -- PART 1 of 8   --   PROD_1_schema.sql
 -- Tables, indexes, APP_SECRETS, mail log, session signing key
 --------------------------------------------------------------------------------

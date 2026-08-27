@@ -9,4 +9,4 @@
 // where a client secret used to be extractable from the installed app
 // package.
  
-export const API_BASE_URL = 'https://karyasiddhi.trinamix.com/ords/repo';
+export const API_BASE_URL = 'https://karyasiddhitest.trinamix.com/ords/repo';
