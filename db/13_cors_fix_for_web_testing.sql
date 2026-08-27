@@ -19,10 +19,10 @@ BEGIN
   OAUTH.UPDATE_CLIENT(
     p_name            => 'EXPENSE_APP_CLIENT',
     p_description     => NULL,
-    p_origins_allowed => 'http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:19006',
+    p_origins_allowed => 'http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:19006,https://napeedmai.github.io',
     p_redirect_uri    => NULL,
     p_support_email   => NULL,
-    p_suppor_uri      => NULL,
+    p_support_uri      => NULL,
     p_privilege_names => NULL
   );
   COMMIT;
@@ -32,7 +32,7 @@ END;
 BEGIN
   ORDS.SET_MODULE_ORIGINS_ALLOWED(
     p_module_name     => 'expenses.employee',
-    p_origins_allowed => 'http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:19006'
+    p_origins_allowed => 'http://localhost:8081,http://localhost:8082,http://localhost:8083,http://localhost:19006,https://napeedmai.github.io'
   );
   COMMIT;
 END;
