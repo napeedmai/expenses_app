@@ -50,6 +50,7 @@ import {
   recordScanOutcome,
 } from '../api/client';
 import { showAlert } from '../utils/alert';
+import { shrinkForAttachment } from '../utils/compressImage';
 
 // Only these can be scanned. The stored-receipt list is wider on purpose -- a
 // spreadsheet or a .rar is a legitimate thing to keep on file and nothing a
@@ -111,7 +112,16 @@ export default function BillSheet({
   const styles = useMemo(() => createStyles(colors), [colors]);
 
   const [f, setF] = useState(EMPTY);
+  // TWO FILES, deliberately.
+  //   picked     -- what gets ATTACHED. Compressed to fit the 1 MB limit.
+  //   scanSource -- what gets READ by the AI. The original, full quality.
+  // They are the same object unless compression happened. The AI gets the good
+  // copy because a receipt total is small print, and the stored copy is the one
+  // that has to fit.
   const [picked, setPicked] = useState(null);   // newly chosen file, not yet uploaded
+  const [scanSource, setScanSource] = useState(null);
+  const [shrinking, setShrinking] = useState(false);
+  const [shrankFrom, setShrankFrom] = useState(null);   // original size in bytes
   const [rate, setRate] = useState(null);
   const [rateError, setRateError] = useState(null);
   const [rateLoading, setRateLoading] = useState(false);
@@ -139,6 +149,9 @@ export default function BillSheet({
     setScan(null);
     setApplied(null);
     setScanning(false);
+    setScanSource(null);
+    setShrinking(false);
+    setShrankFrom(null);
     if (bill) {
       setF({
         bill_no: bill.bill_no || '',
@@ -225,7 +238,25 @@ export default function BillSheet({
         );
         return;
       }
-      setPicked(file);
+      // The original is always what the AI reads.
+      setScanSource(file);
+
+      if (!file.size || file.size <= MAX_BYTES) {
+        setPicked(file);
+        setShrankFrom(null);
+        return;
+      }
+
+      // Too big to store. Try to make a copy that fits rather than making the
+      // person photograph the receipt a second time.
+      setShrinking(true);
+      try {
+        const res = await shrinkForAttachment(file, MAX_BYTES);
+        setPicked(res.file);
+        setShrankFrom(res.compressed ? res.originalSize : null);
+      } finally {
+        setShrinking(false);
+      }
     } catch (e) {
       showAlert('Could not open the file picker', e.message || 'Please try again.');
     }
@@ -238,10 +269,11 @@ export default function BillSheet({
   // a read nobody asked for. It also means the person can scan twice if the
   // first photo was bad.
   const canScan = useMemo(() => {
-    if (!picked) return false;
-    const ext = String(picked.name || '').split('.').pop().toLowerCase();
+    const f = scanSource || picked;
+    if (!f) return false;
+    const ext = String(f.name || '').split('.').pop().toLowerCase();
     return SCANNABLE.includes(ext);
-  }, [picked]);
+  }, [scanSource, picked]);
 
   // Over the ATTACH limit but within the SCAN limit. Scannable, not storable.
   // The bill can still be saved -- a receipt is only required to SUBMIT -- so
@@ -249,11 +281,11 @@ export default function BillSheet({
   const tooBigToAttach = !!(picked && picked.size && picked.size > MAX_BYTES);
 
   async function handleScan() {
-    if (!picked) return;
+    if (!scanSource && !picked) return;
     setScanning(true);
     setError(null);
     try {
-      const res = await scanReceipt(empId, picked);
+      const res = await scanReceipt(empId, scanSource || picked);
       // The endpoint answers 200 for an unreadable photo too -- the request was
       // fine, the image was not. So the error lives in the body, not the status.
       if (!res || res.error || !res.fields) {
@@ -536,18 +568,32 @@ export default function BillSheet({
               {receiptLabel || 'Choose a file (pdf, jpg, png, xlsx, xls, csv, rar)'}
             </Text>
           </TouchableOpacity>
-          {picked && !tooBigToAttach ? (
+          {shrinking ? (
+            <Text style={styles.hint}>Resizing the photo so it can be attached…</Text>
+          ) : null}
+
+          {/* Said, not silent. The stored copy is not the file they chose, and
+              anyone comparing the two later deserves to know why. */}
+          {!shrinking && shrankFrom ? (
+            <Text style={styles.hint}>
+              Resized from {(shrankFrom / (1024 * 1024)).toFixed(1)} MB to{' '}
+              {(picked.size / 1024).toFixed(0)} KB to fit the 1 MB limit. The full
+              quality photo is still what gets read below.
+            </Text>
+          ) : null}
+
+          {picked && !tooBigToAttach && !shrinking && !shrankFrom ? (
             <Text style={styles.hint}>Uploads when you save this bill.</Text>
           ) : null}
 
-          {/* Scannable but not storable. Worth spelling out rather than failing
-              at save: the photo can still fill the form, and a receipt is only
-              required to SUBMIT, so saving now loses nothing but the file. */}
-          {tooBigToAttach ? (
+          {/* Only reachable now if compression could not get it under 1 MB --
+              a PDF, or an image that resists. Rare, but it must still say so
+              rather than failing at save. */}
+          {tooBigToAttach && !shrinking ? (
             <Text style={styles.appliedNote}>
-              This photo is {(picked.size / (1024 * 1024)).toFixed(1)} MB — over the
-              1 MB attachment limit, so it will not be attached. You can still read
-              the fields off it below, then attach a smaller photo before submitting.
+              This file is {(picked.size / (1024 * 1024)).toFixed(1)} MB and could not
+              be made smaller, so it will not be attached. You can still read the
+              fields off it below, then attach a smaller file before submitting.
             </Text>
           ) : null}
 
@@ -575,7 +621,7 @@ export default function BillSheet({
             <TouchableOpacity
               style={styles.scanBtn}
               onPress={handleScan}
-              disabled={scanning || saving}
+              disabled={scanning || saving || shrinking}
             >
               {scanning ? (
                 <ActivityIndicator color={colors.primary} />

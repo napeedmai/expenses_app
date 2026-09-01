@@ -11,7 +11,6 @@ import { NavigationContainer } from '@react-navigation/native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { SessionProvider, useSession } from './src/SessionContext';
 import { ThemeProvider, useTheme } from './src/ThemeContext';
-import { usePushNotifications } from './src/pushNotifications';
 import LoginScreen from './src/screens/LoginScreen';
 import MainTabs from './src/navigation/MainTabs';
 
@@ -34,10 +33,23 @@ function Root() {
   const { session, loading } = useSession();
   const { colors } = useTheme();
 
-  // Registers this device for real push notifications once a session
-  // exists — see src/pushNotifications.js. Runs on every login/app-open;
-  // it's a quick no-op if this device is already registered.
-  usePushNotifications(session ? session.empId : null);
+  // PUSH NOTIFICATIONS ARE DISABLED IN THIS RELEASE.
+  //
+  // usePushNotifications() used to run here. Delivery has never worked: sending
+  // requires an outbound HTTPS call from Oracle to exp.host, which needs a TLS
+  // wallet that has been an open DBA request since July (db/DBA_REQUEST_push_
+  // wallet.md). Shipping the permission prompt for something that then delivers
+  // nothing is a poor first impression, and app stores do query permissions an
+  // app never uses.
+  //
+  // src/pushNotifications.js is kept, unimported. It holds the parts that were
+  // genuinely hard to get right -- the SDK 53 shouldShowBanner/shouldShowList
+  // rename, and the fact that an Android channel's importance is frozen at
+  // creation -- and none of that is worth rediscovering.
+  //
+  // To turn it back on: restore the import and this call, put back the
+  // expo-notifications plugin and POST_NOTIFICATIONS in app.json, reinstall the
+  // package, and rebuild. Email notifications are unaffected and still work.
 
   if (loading) {
     return (
