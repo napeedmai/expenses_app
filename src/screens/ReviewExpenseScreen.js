@@ -14,8 +14,6 @@ import React, { useState, useMemo, useEffect } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Image,
-  Modal,
   Platform,
   ScrollView,
   StyleSheet,
@@ -33,13 +31,11 @@ import {
   acceptExpense,
   reviseExpense,
   rejectExpense,
-  getAttachmentDownloadHeaders,
   listItems,
-  getItemAttachmentUrl,
 } from '../api/client';
 import { radius, shadow, fileBadgeForName, stageLabelShort } from '../theme';
 import { showAlert } from '../utils/alert';
-import { openAttachment } from '../utils/openAttachment';
+import BillDetailSheet from '../components/BillDetailSheet';
 
 export default function ReviewExpenseScreen({ route, navigation }) {
   const { session } = useSession();
@@ -50,8 +46,11 @@ export default function ReviewExpenseScreen({ route, navigation }) {
   const [comment, setComment] = useState('');
   const [submitting, setSubmitting] = useState(null); // 'accept' | 'revise' | 'reject' | null
   const [error, setError] = useState(null);
-  const [previewing, setPreviewing] = useState(null);   // the bill id being opened
-  const [previewImageUri, setPreviewImageUri] = useState(null);
+  // The reviewer gets the same bill detail the submitter does. They are the
+  // person with the strongest reason to read a bill closely -- they are deciding
+  // whether to pay it -- and until now they could open the receipt but never see
+  // the bill's own fields: no bill date, no period, no conversion rate.
+  const [detailBill, setDetailBill] = useState(null);
   const [bills, setBills] = useState([]);
   const [billsLoading, setBillsLoading] = useState(true);
 
@@ -92,28 +91,6 @@ export default function ReviewExpenseScreen({ route, navigation }) {
       setError(e.message || `Failed to ${action} this expense.`);
     } finally {
       setSubmitting(null);
-    }
-  }
-
-  // Shared with AddEditExpenseScreen via src/utils/openAttachment.js — a
-  // reviewer needs to see the receipt before deciding, and this was previously
-  // a near-copy of that screen's version, which meant the PDF-opening bug had
-  // to be found and fixed twice.
-  async function handlePreviewBill(bill) {
-    setPreviewing(bill.id);
-    setError(null);
-    try {
-      const headers = await getAttachmentDownloadHeaders(empId);
-      await openAttachment({
-        url: getItemAttachmentUrl(expense.id, bill.id),
-        headers,
-        filename: bill.attachment_filename,
-        onImage: setPreviewImageUri,
-      });
-    } catch (e) {
-      setError(e.message || 'Failed to open that receipt.');
-    } finally {
-      setPreviewing(null);
     }
   }
 
@@ -178,7 +155,12 @@ export default function ReviewExpenseScreen({ route, navigation }) {
         bills.map((b) => {
           const bBadge = b.attachment_filename ? fileBadgeForName(b.attachment_filename) : null;
           return (
-            <View key={b.id} style={styles.attachedRow}>
+            <TouchableOpacity
+              key={b.id}
+              style={styles.attachedRow}
+              onPress={() => setDetailBill(b)}
+              activeOpacity={0.7}
+            >
               {b.has_receipt === 'Y' && bBadge ? (
                 <View style={[styles.fileBadge, { backgroundColor: bBadge.bg }]}>
                   <Text style={[styles.fileBadgeText, { color: bBadge.text }]}>{bBadge.label}</Text>
@@ -205,22 +187,8 @@ export default function ReviewExpenseScreen({ route, navigation }) {
                   </Text>
                 ) : null}
               </View>
-              {b.has_receipt === 'Y' ? (
-                <TouchableOpacity
-                  onPress={() => handlePreviewBill(b)}
-                  disabled={previewing === b.id}
-                  style={{ padding: 4 }}
-                >
-                  {previewing === b.id ? (
-                    <ActivityIndicator color={colors.primary} />
-                  ) : (
-                    <Text style={styles.viewLink}>View</Text>
-                  )}
-                </TouchableOpacity>
-              ) : (
-                <Text style={styles.noReceipt}>no receipt</Text>
-              )}
-            </View>
+              <Ionicons name="chevron-forward" size={16} color={colors.textFaint} />
+            </TouchableOpacity>
           );
         })
       )}
@@ -274,16 +242,15 @@ export default function ReviewExpenseScreen({ route, navigation }) {
         </TouchableOpacity>
       </View>
 
-      <Modal visible={!!previewImageUri} transparent animationType="fade">
-        <View style={styles.previewOverlay}>
-          <TouchableOpacity style={styles.previewCloseButton} onPress={() => setPreviewImageUri(null)}>
-            <Text style={styles.previewCloseText}>Close</Text>
-          </TouchableOpacity>
-          {previewImageUri && (
-            <Image source={{ uri: previewImageUri }} style={styles.previewImage} resizeMode="contain" />
-          )}
-        </View>
-      </Modal>
+      {/* canEdit is false: a reviewer reads a bill, never changes one. */}
+      <BillDetailSheet
+        visible={!!detailBill}
+        empId={empId}
+        expenseId={expense.id}
+        bill={detailBill}
+        canEdit={false}
+        onClose={() => setDetailBill(null)}
+      />
     </ScrollView>
   );
 }
@@ -366,8 +333,6 @@ function createStyles(colors) {
   attachmentName: { fontSize: 13.5, fontWeight: '700', color: colors.text },
   attachmentSub: { fontSize: 11, color: colors.textFaint, marginTop: 1 },
   billsHeader: { marginTop: 18 },
-  noReceipt: { fontSize: 11, color: colors.textFaint, fontStyle: 'italic', paddingHorizontal: 4 },
-  viewLink: { color: colors.primary, fontWeight: '700', fontSize: 13 },
 
   error: { color: colors.red, marginBottom: 12, fontWeight: '600' },
   label: { fontSize: 12, color: colors.textMuted, marginBottom: 6, fontWeight: '700' },
@@ -393,18 +358,5 @@ function createStyles(colors) {
   reviseButtonText: { color: colors.status.REVISION_REQUESTED.text },
   rejectButtonText: { color: colors.status.REJECTED.text },
 
-  previewOverlay: { flex: 1, backgroundColor: 'rgba(15,23,42,0.94)', justifyContent: 'center', alignItems: 'center' },
-  previewImage: { width: '100%', height: '80%' },
-  previewCloseButton: {
-    position: 'absolute',
-    top: 50,
-    right: 20,
-    backgroundColor: 'rgba(255,255,255,0.15)',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-    zIndex: 1,
-  },
-  previewCloseText: { color: '#fff', fontWeight: '600' },
   });
 }

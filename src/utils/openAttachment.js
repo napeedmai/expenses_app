@@ -121,4 +121,58 @@ export async function openAttachment({ url, headers, filename, onImage }) {
   );
 }
 
+/**
+ * Fetch an attachment and return something that can be RENDERED, rather than
+ * handed to the operating system.
+ *
+ * openAttachment() above is "give this file to whatever can open it" — a share
+ * sheet, a PDF reader, a download. That is the right behaviour for a button
+ * called Open. It is the wrong behaviour for showing somebody their own receipt
+ * inside the app, which is what BillDetailSheet needs: the receipt is part of
+ * the bill, not a file to take away.
+ *
+ * @returns {Promise<{uri: string, mimeType: string, isImage: boolean, isPdf: boolean}>}
+ */
+export async function loadAttachment({ url, headers, filename }) {
+  const safeName = filename || 'attachment';
+
+  if (Platform.OS === 'web') {
+    const res = await fetch(url, { headers });
+    if (!res.ok) throw new Error('Could not load the receipt.');
+    const blob = await res.blob();
+    // The server may answer application/octet-stream, from which nothing can be
+    // concluded. The filename still knows.
+    const mimeType =
+      (blob.type && blob.type !== 'application/octet-stream' ? blob.type : null) ||
+      mimeFromFilename(safeName) ||
+      '';
+    return {
+      uri: URL.createObjectURL(blob),
+      mimeType,
+      isImage: mimeType.startsWith('image/'),
+      isPdf: mimeType === 'application/pdf',
+    };
+  }
+
+  const localUri = FileSystem.cacheDirectory + safeName;
+  const result = await FileSystem.downloadAsync(url, localUri, { headers });
+  if (result.status !== 200) throw new Error('Could not load the receipt.');
+
+  let mimeType = (
+    result.headers['Content-Type'] ||
+    result.headers['content-type'] ||
+    ''
+  ).toLowerCase();
+  if (!mimeType || mimeType.startsWith('application/octet-stream')) {
+    mimeType = mimeFromFilename(safeName) || mimeType;
+  }
+
+  return {
+    uri: result.uri,
+    mimeType,
+    isImage: mimeType.startsWith('image/'),
+    isPdf: mimeType === 'application/pdf',
+  };
+}
+
 export default openAttachment;

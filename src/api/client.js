@@ -636,17 +636,13 @@ export function mdyFromISO(iso) {
   return `${mm}/${dd}/${yyyy}`;
 }
 
-// Registers (or updates) this device's Expo push token for empId, so the
-// backend knows where to deliver real phone notifications — see
-// src/pushNotifications.js for where this gets called from.
-export async function registerPushToken(empId, token) {
-  const res = await fetchWithTimeout(`${API_BASE_URL}/expenses/push-token`, {
-    method: 'POST',
-    headers: await authHeaders(empId, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ push_token: token }),
-  });
-  return handle(res);
-}
+// Push notifications were removed from this application — db/84_drop_push.sql
+// dropped SEND_PUSH_NOTIFICATION, TEST_PUSH_NOTIFICATION and EMP_PUSH_TOKENS,
+// and registerPushToken went with them.
+//
+// POST /expenses/push-token now answers 410 Gone rather than 404, so an older
+// installed build gets told the endpoint was retired on purpose instead of
+// being told it got the URL wrong.
 
 // ---- Reviewer-facing endpoints (Phase 2B — Reporting Manager / Finance Manager) ----
 

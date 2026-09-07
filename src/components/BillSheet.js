@@ -36,7 +36,6 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import * as DocumentPicker from 'expo-document-picker';
 import { useTheme } from '../ThemeContext';
 import { radius } from '../theme';
 import PickerField from './PickerField';
@@ -51,6 +50,7 @@ import {
 } from '../api/client';
 import { showAlert } from '../utils/alert';
 import { shrinkForAttachment } from '../utils/compressImage';
+import { takePhoto, pickFromGallery, pickFile, SUPPORTS_CAMERA } from '../utils/pickReceipt';
 
 // Only these can be scanned. The stored-receipt list is wider on purpose -- a
 // spreadsheet or a .rar is a legitimate thing to keep on file and nothing a
@@ -122,6 +122,7 @@ export default function BillSheet({
   const [scanSource, setScanSource] = useState(null);
   const [shrinking, setShrinking] = useState(false);
   const [shrankFrom, setShrankFrom] = useState(null);   // original size in bytes
+  const [sourceOpen, setSourceOpen] = useState(false);  // camera / gallery / file
   const [rate, setRate] = useState(null);
   const [rateError, setRateError] = useState(null);
   const [rateLoading, setRateLoading] = useState(false);
@@ -152,6 +153,7 @@ export default function BillSheet({
     setScanSource(null);
     setShrinking(false);
     setShrankFrom(null);
+    setSourceOpen(false);
     if (bill) {
       setF({
         bill_no: bill.bill_no || '',
@@ -211,12 +213,22 @@ export default function BillSheet({
     };
   }, [empId, f.amount, f.currency, f.from_date]);
 
-  async function handlePick() {
+  // The button. On native it asks where the receipt is coming from; on web the
+  // browser's own file input already offers Camera on a phone, so a menu would
+  // only add a tap.
+  function handlePick() {
+    if (SUPPORTS_CAMERA) setSourceOpen(true);
+    else chooseFrom(pickFile);
+  }
+
+  // One place where a chosen file is validated, sized and compressed, whatever
+  // it came from. Keeping this separate from the three pickers is what stops
+  // the camera path quietly skipping a check the file path does.
+  async function chooseFrom(picker) {
+    setSourceOpen(false);
     try {
-      const res = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true });
-      if (res.canceled) return;
-      const file = res.assets && res.assets[0];
-      if (!file) return;
+      const file = await picker();
+      if (!file) return;              // cancelled -- not an error
 
       const ext = String(file.name || '').split('.').pop().toLowerCase();
       if (!ALLOWED_EXTENSIONS.includes(ext)) {
@@ -258,7 +270,12 @@ export default function BillSheet({
         setShrinking(false);
       }
     } catch (e) {
-      showAlert('Could not open the file picker', e.message || 'Please try again.');
+      // A refused permission is an answer, not a failure. Say what to do and
+      // leave the other options available.
+      showAlert(
+        e.permissionDenied ? 'Permission needed' : 'Could not open that',
+        e.message || 'Please try again.'
+      );
     }
   }
 
@@ -649,6 +666,62 @@ export default function BillSheet({
         </ScrollView>
       </View>
 
+      {/* ---- where is the receipt coming from ---- */}
+      {/*
+          Native only. Take Photo is first because it is the common case: the
+          receipt is in your hand and the point of the app is not to make you
+          leave it, photograph, come back and go hunting in Files.
+      */}
+      <Modal
+        visible={sourceOpen}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setSourceOpen(false)}
+      >
+        <TouchableOpacity
+          style={styles.reviewBackdrop}
+          activeOpacity={1}
+          onPress={() => setSourceOpen(false)}
+        >
+          <View style={styles.sourceCard}>
+            <Text style={styles.reviewTitle}>Add a receipt</Text>
+
+            <TouchableOpacity style={styles.sourceRow} onPress={() => chooseFrom(takePhoto)}>
+              <Ionicons name="camera-outline" size={22} color={colors.primary} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.sourceLabel}>Take Photo</Text>
+                <Text style={styles.sourceHint}>Use the camera now</Text>
+              </View>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.sourceRow} onPress={() => chooseFrom(pickFromGallery)}>
+              <Ionicons name="images-outline" size={22} color={colors.primary} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.sourceLabel}>Choose from Gallery</Text>
+                <Text style={styles.sourceHint}>A photo you already took</Text>
+              </View>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.sourceRow} onPress={() => chooseFrom(pickFile)}>
+              <Ionicons name="document-outline" size={22} color={colors.primary} />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.sourceLabel}>Choose a File</Text>
+                <Text style={styles.sourceHint}>
+                  PDF or anything else ({ALLOWED_EXTENSIONS.join(', ')})
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.reviewCancel}
+              onPress={() => setSourceOpen(false)}
+            >
+              <Text style={styles.reviewCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
       {/* ---- review sheet ---- */}
       {/*
           Nothing reaches the form until Apply. That was a deliberate choice
@@ -883,5 +956,23 @@ function createStyles(colors) {
     },
     reviewApplyText: { color: '#fff', fontSize: 14, fontWeight: '700' },
     reviewFoot: { fontSize: 11, color: colors.textFaint, marginTop: 10, textAlign: 'center' },
+
+    sourceCard: {
+      backgroundColor: colors.bg,
+      borderTopLeftRadius: radius.lg,
+      borderTopRightRadius: radius.lg,
+      padding: 18,
+      paddingBottom: Platform.OS === 'ios' ? 34 : 18,
+    },
+    sourceRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 14,
+      paddingVertical: 14,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+    },
+    sourceLabel: { fontSize: 15, color: colors.text, fontWeight: '600' },
+    sourceHint: { fontSize: 12, color: colors.textFaint, marginTop: 2 },
   });
 }

@@ -33,23 +33,22 @@ function Root() {
   const { session, loading } = useSession();
   const { colors } = useTheme();
 
-  // PUSH NOTIFICATIONS ARE DISABLED IN THIS RELEASE.
+  // PUSH NOTIFICATIONS HAVE BEEN REMOVED, CLIENT AND SERVER.
   //
-  // usePushNotifications() used to run here. Delivery has never worked: sending
+  // usePushNotifications() used to run here. Delivery never worked: sending
   // requires an outbound HTTPS call from Oracle to exp.host, which needs a TLS
   // wallet that has been an open DBA request since July (db/DBA_REQUEST_push_
-  // wallet.md). Shipping the permission prompt for something that then delivers
+  // wallet.md). Shipping a permission prompt for something that then delivers
   // nothing is a poor first impression, and app stores do query permissions an
   // app never uses.
   //
-  // src/pushNotifications.js is kept, unimported. It holds the parts that were
-  // genuinely hard to get right -- the SDK 53 shouldShowBanner/shouldShowList
-  // rename, and the fact that an Android channel's importance is frozen at
-  // creation -- and none of that is worth rediscovering.
-  //
-  // To turn it back on: restore the import and this call, put back the
-  // expo-notifications plugin and POST_NOTIFICATIONS in app.json, reinstall the
-  // package, and rebuild. Email notifications are unaffected and still work.
+  // db/84_drop_push.sql finished the job on the database side: SEND_PUSH_
+  // NOTIFICATION, TEST_PUSH_NOTIFICATION and EMP_PUSH_TOKENS are dropped,
+  // process_expense_action and the submit handler no longer call them, and
+  // POST /expenses/push-token answers 410 Gone. src/pushNotifications.js and
+  // registerPushToken are deleted -- git history has them if push is ever
+  // revived, and by then the SDK details worth keeping will be out of date
+  // anyway. Email notifications are unaffected and still work.
 
   if (loading) {
     return (

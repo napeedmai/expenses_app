@@ -37,6 +37,7 @@ import { useSession } from '../SessionContext';
 import { useTheme } from '../ThemeContext';
 import PickerField from '../components/PickerField';
 import BillSheet from '../components/BillSheet';
+import BillDetailSheet from '../components/BillDetailSheet';
 import { radius, shadow, stageLabel, fileBadgeForName } from '../theme';
 import { showAlert } from '../utils/alert';
 import {
@@ -96,6 +97,12 @@ export default function AddEditExpenseScreen({ route, navigation }) {
 
   const [sheetOpen, setSheetOpen] = useState(false);
   const [editingBill, setEditingBill] = useState(null);
+
+  // Tapping a bill opens it to READ. Editing is a button inside that, not the
+  // default action -- looking at a bill is far commoner than changing one, and
+  // once a claim is submitted the edit form is locked anyway, which made every
+  // tap open a greyed-out form pretending to be editable.
+  const [detailBill, setDetailBill] = useState(null);
 
   const isLocked = !!expenseId && !EDITABLE_STATUSES.includes(status);
 
@@ -444,8 +451,7 @@ export default function AddEditExpenseScreen({ route, navigation }) {
               <TouchableOpacity
                 key={b.id}
                 style={styles.billRow}
-                onPress={() => handleOpenSheet(b)}
-                disabled={isLocked}
+                onPress={() => setDetailBill(b)}
                 activeOpacity={0.7}
               >
                 <View style={styles.billNo}>
@@ -478,6 +484,12 @@ export default function AddEditExpenseScreen({ route, navigation }) {
                   </Text>
                   <Text style={styles.billUsd}>${b.amount_usd}</Text>
                 </View>
+
+                <Ionicons
+                  name="chevron-forward"
+                  size={16}
+                  color={colors.textFaint}
+                />
                 {!isLocked ? (
                   <TouchableOpacity
                     onPress={() => handleDeleteBill(b)}
@@ -551,6 +563,20 @@ export default function AddEditExpenseScreen({ route, navigation }) {
           setSheetOpen(false);
           setEditingBill(null);
         }}
+      />
+
+      <BillDetailSheet
+        visible={!!detailBill}
+        empId={empId}
+        expenseId={expenseId}
+        bill={detailBill}
+        canEdit={!isLocked}
+        onEdit={() => {
+          const b = detailBill;
+          setDetailBill(null);
+          handleOpenSheet(b);
+        }}
+        onClose={() => setDetailBill(null)}
       />
     </View>
   );

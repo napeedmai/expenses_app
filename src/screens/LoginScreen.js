@@ -80,13 +80,30 @@ export default function LoginScreen() {
         accessTokenExpiresAt: Date.now() + (me.expires_in || 3600) * 1000,
       });
     } catch (e) {
-      if (e.status === 401) {
-        setError('Invalid email or password.');
-      } else if (e.status === 403) {
-        setError('This account is not linked to an active employee record.');
-      } else {
-        setError(e.message || 'Failed to log in.');
-      }
+      // THE SERVER'S MESSAGE WINS.
+      //
+      // This used to substitute hardcoded text for 401 and 403 and discard
+      // whatever the backend said. That was fine while each status meant
+      // exactly one thing, and actively harmful once they did not:
+      //
+      //   403 "This account is locked after too many failed sign-in attempts"
+      //       was displayed as "not linked to an active employee record"
+      //   401 "Invalid email or password. Try again in 5 seconds."
+      //       lost the part telling the person how long to wait
+      //
+      // A locked-out user was being told to contact HR about their employee
+      // record when what they needed was an administrator to unlock the
+      // account. db/88 went to some trouble to make the backend say the right
+      // thing; this line is what lets anyone read it.
+      //
+      // The fallbacks still cover a response with no body at all — a gateway
+      // error, a dropped connection — where there is no server message to show.
+      setError(
+        e.message
+        || (e.status === 401 ? 'Invalid email or password.'
+          : e.status === 403 ? 'This account cannot sign in. Contact your administrator.'
+          : 'Failed to log in.')
+      );
     } finally {
       setLoading(false);
     }

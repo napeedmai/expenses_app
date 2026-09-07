@@ -92,11 +92,43 @@ function usdAmount(e) {
   return Number(e.amount) || 0;
 }
 
+// A claim's spend, split by category.
+//
+// Since multi-bill there is no single type for a claim — the type lives on each
+// bill, and one claim routinely mixes them (an air fare and a hotel on the same
+// trip). db/82 has /expenses/mine return the per-type totals already grouped by
+// the database:
+//
+//     type_totals = "Air Fare=600|Hotel=500"
+//
+// which is one string per claim rather than an items request per claim.
+//
+// The fallback matters. Before 82 the field is absent, and before script 64 the
+// claim itself carried a `type`. Neither is true of dev now, but prod is one of
+// them until someone runs 82 there, so returning [] instead would blank the
+// chart on an environment where it currently works — badly, but visibly.
+function claimCategories(e) {
+  if (typeof e.type_totals === 'string' && e.type_totals.length > 0) {
+    const parts = e.type_totals.split('|').map((pair) => {
+      // rsplit: 'Internet/Wifi=40' — the type may contain anything except '='.
+      const at = pair.lastIndexOf('=');
+      if (at < 1) return null;
+      const total = Number(pair.slice(at + 1));
+      if (!Number.isFinite(total)) return null;
+      return { type: pair.slice(0, at), total };
+    }).filter(Boolean);
+    if (parts.length > 0) return parts;
+  }
+  // No usable breakdown: attribute the whole claim to its own type, or Other.
+  return [{ type: e.type || 'Other', total: usdAmount(e) }];
+}
+
 function categoryBreakdown(expenses) {
   const sums = {};
   expenses.forEach((e) => {
-    const key = e.type || 'Other';
-    sums[key] = (sums[key] || 0) + usdAmount(e);
+    claimCategories(e).forEach(({ type, total }) => {
+      sums[type] = (sums[type] || 0) + total;
+    });
   });
   const entries = Object.entries(sums).sort((a, b) => b[1] - a[1]).slice(0, 3);
   const max = entries.length ? entries[0][1] : 1;
